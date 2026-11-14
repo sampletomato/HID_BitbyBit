@@ -114,6 +114,12 @@ async def lifespan(app: FastAPI):
     t0 = time.time()
     state.face.load()
     state.liveness.load()
+    # Pull the schedule now so the first real /verify does not pay for the
+    # Supabase round trip, and so the log says which source is in play.
+    rows = policy.store.load(force=True)
+    log.info("schedule: %d row(s) from %s, zone=%s, grace=%d min",
+             len(rows), policy.store.source, config.KIOSK_ZONE,
+             config.SCHEDULE_GRACE_MIN)
     _warmup()
     log.info("ready in %.2fs (MODE=%s, face=%s, DEV_MODE=%s)",
              time.time() - t0, config.MODE, state.face.backend_name, config.DEV_MODE)
