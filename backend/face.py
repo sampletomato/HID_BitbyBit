@@ -100,6 +100,10 @@ def assess_quality(images: List[np.ndarray], min_frames: int) -> Quality:
     med_blur = float(np.median(blurs))
     med_bright = float(np.median(brights))
 
+    log.info("quality: median blur=%.1f (min %.0f)  brightness=%.1f (min %.0f)  "
+             "good=%d/%d", med_blur, config.MIN_BLUR_VAR, med_bright,
+             config.MIN_BRIGHTNESS, good, len(images))
+
     if good / len(images) < config.MIN_GOOD_FRAME_RATIO:
         # Brightness first: an over- or under-exposed frame is also flat, so it
         # would otherwise be misreported as blur.
@@ -311,6 +315,11 @@ class Gallery:
     def consume_totp_step(self, name: str, step: int):
         if name in self.users:
             self.users[name]["totp_last_step"] = step
+            self._save()
+
+    def mark_confirmed(self, name: str):
+        if name in self.users:
+            self.users[name]["authenticator_confirmed"] = True
             self._save()
 
     def names(self) -> List[str]:

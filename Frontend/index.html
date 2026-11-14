@@ -54,28 +54,43 @@
           <p class="inline-error" id="enrollError" hidden></p>
         </div>
         <div id="viewEnrollment" class="view">
-          <div class="success-mark">✓</div>
-          <h1>You're <span>enrolled.</span></h1>
-          <p class="lede">Scan this QR code with Google Authenticator.</p>
-          <div class="qr-wrap"><img id="qrImage" alt="Authenticator setup QR code"></div>
-          <div class="enrolled-name" id="enrolledName"></div>
-          <button class="btn btn-primary" data-home>Done <span class="arrow">→</span></button>
+          <div id="enrollSetup">
+            <h1>Set up your <span>authenticator.</span></h1>
+            <p class="lede">Scan this QR code with Google Authenticator, then enter the 6-digit code to confirm.</p>
+            <div class="qr-wrap"><img id="qrImage" alt="Authenticator setup QR code"></div>
+            <label class="field-label" for="confirmCodeInput">6-DIGIT CODE</label>
+            <input id="confirmCodeInput" class="text-input otp-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000">
+            <button class="btn btn-primary" id="confirmEnrollBtn">Confirm <span class="arrow">→</span></button>
+            <p class="inline-error" id="confirmError" hidden></p>
+          </div>
+          <div id="enrollComplete" hidden>
+            <div class="success-mark">✓</div>
+            <h1>Registration <span>complete.</span></h1>
+            <div class="enrolled-name" id="enrolledName"></div>
+            <button class="btn btn-primary" data-home>Done <span class="arrow">→</span></button>
+          </div>
         </div>
         <div id="viewResult" class="view">
           <div id="resultIcon" class="result-icon">✓</div>
           <h1 id="resultTitle">Access granted</h1>
-          <div id="resultName" class="result-name"></div>
-          <div class="metric-grid">
-            <div class="metric"><span>LIVENESS</span><strong id="liveMetric">—</strong></div>
-            <div class="metric"><span>FACE MATCH</span><strong id="matchMetric">—</strong></div>
-            <div class="metric"><span>DECISION TIME</span><strong id="timeMetric">—</strong></div>
-          </div>
-          <div id="scheduleReason" class="schedule-reason" hidden></div>
-          <div id="reasonChips" class="reason-chips"></div>
-          <div class="signals" id="signals">
-            <div class="signals-title">SIGNAL BREAKDOWN <span id="latencySummary"></span></div>
-            <div id="signalRows"></div>
-          </div>
+          <p id="resultMessage" class="result-message"></p>
+          <div id="resultSummary" class="result-summary"></div>
+          <details id="resultDetails" class="result-details">
+            <summary>Details</summary>
+            <div class="details-body">
+              <div class="metric-grid">
+                <div class="metric"><span>LIVENESS</span><strong id="liveMetric">—</strong></div>
+                <div class="metric"><span>FACE MATCH</span><strong id="matchMetric">—</strong></div>
+                <div class="metric"><span>DECISION TIME</span><strong id="timeMetric">—</strong></div>
+              </div>
+              <div class="signals" id="signals">
+                <div class="signals-title">SIGNAL BREAKDOWN <span id="latencySummary"></span></div>
+                <div id="signalRows"></div>
+              </div>
+              <div id="reasonChips" class="reason-chips"></div>
+              <div id="scheduleReason" class="schedule-reason" hidden></div>
+            </div>
+          </details>
           <button class="btn btn-primary result-home" data-home>Return home <span class="arrow">→</span></button>
         </div>
         <div id="viewChallenge" class="view">
@@ -88,7 +103,7 @@
         <div id="viewOtp" class="view">
           <div class="challenge-symbol">⌑</div>
           <h1>Authenticator<br><span>check.</span></h1>
-          <p class="lede">Enter the 6-digit code from your authenticator app.</p>
+          <p class="lede" id="otpLede">Open Google Authenticator and enter the 6-digit code.</p>
           <input id="otpInput" class="text-input otp-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000">
           <button class="btn btn-primary" id="otpBtn">Verify code <span class="arrow">→</span></button>
           <div class="demo-phone"><div class="demo-phone-head"><span>DEMO PHONE</span><button id="demoCodeBtn">Show code ↗</button></div><div class="demo-code" id="demoCode">······</div><div class="demo-caption">Google Authenticator · HID Kiosk</div></div>

@@ -64,10 +64,10 @@ ANTISPOOF_INPUT = 128
 ANTISPOOF_BBOX_EXPANSION = 1.5   # facenox default; the model expects this context
 ANTISPOOF_FRAMES = 3             # run on the 3 sharpest detected frames of the burst
 ANTISPOOF_REAL_MIN = 0.5         # real-probability above which a frame reads "live"
-# A confident spoof hard-vetoes to DENY on its own. Without this, while blink
-# and device are still stubbed optimistic, fusion alone would only reach
-# STEP_UP for an obvious photo/screen attack. Genuine faces score >> this.
-ANTISPOOF_SPOOF_VETO = 0.30
+# Hard gate: real_prob below this is an immediate DENY -- motion or match can
+# never rescue a failed anti-spoof. The decision liveness is also gated at
+# min(passive, fused), so a low passive caps the whole score. Genuine faces >> this.
+ANTISPOOF_HARD_DENY = 0.30
 
 # --------------------------------------------------- blink + motion (MediaPipe)
 # Face Landmarker (Tasks API) run on every verify frame. EAR = eye aspect ratio.
@@ -80,13 +80,19 @@ MOTION_YAWPITCH_FULL_DEG = 6.0
 
 # ----------------------------------------------------- device detection (YOLO)
 YOLO_MODEL = MODEL_DIR / "yolov8n.pt"
-YOLO_CONF = 0.35
+YOLO_CONF = 0.25            # lowered to catch phones/screens more readily
 YOLO_IMGSZ = 320             # 320 is ~3x faster than 640 on CPU; phones/screens are large
 YOLO_FRAMES = 2              # run on 2 frames of the burst (CPU cost)
 YOLO_DEVICE_CLASSES = ("cell phone", "laptop", "tv")
-# A device box counts as a spoof when it covers at least this fraction of the
-# face box (a phone/screen showing a face surrounds it -> ratio near 1.0).
-DEVICE_FACE_OVERLAP = 0.20
+# A replay attack puts the face INSIDE the device: the test is therefore "how
+# much of the face box lies inside the device box", not "do the boxes touch".
+# A TV or monitor in the background overlaps the frame but not the face, so it
+# no longer trips the check.
+DEVICE_FACE_INSIDE = 0.60     # tv/laptop: >=60% of the face area inside the box
+DEVICE_FACE_OVERLAP = 0.20    # "cell phone": a phone held near the face is enough
+# A tv/laptop box covering more than this fraction of the frame is the room, not
+# a replay device -- ignored unless the face is genuinely inside it.
+DEVICE_MAX_FRAME_FRAC = 0.50
 
 # ------------------------------------------------------------- fusion weights
 # Weighted mix of the three graded liveness signals. Must sum to 1.0. The device
@@ -97,12 +103,16 @@ W_BLINK = 0.15     # eye-aspect-ratio blink evidence
 
 # ---------------------------------------------------------------- quality gate
 MIN_FRAMES_ENROLL = 3
-MIN_FRAMES_VERIFY = 5
+MIN_FRAMES_VERIFY = 3      # relaxed for a dim, low-quality demo webcam (was 5)
 MIN_FRAMES_CHALLENGE = 10
-MIN_BLUR_VAR = 45.0        # variance of Laplacian, lower = too blurry
-MIN_BRIGHTNESS = 45.0      # mean grey level, lower = too dark
-MAX_BRIGHTNESS = 225.0     # higher = blown out / backlit
-MIN_GOOD_FRAME_RATIO = 0.5  # at least half the burst must pass
+MIN_BLUR_VAR = 10.0        # variance of Laplacian, lower = too blurry (relaxed, was 45)
+MIN_BRIGHTNESS = 20.0      # mean grey level, lower = too dark (relaxed, was 45)
+MAX_BRIGHTNESS = 240.0     # higher = blown out / backlit
+# Mean grey level of the FACE crop below which the passive anti-spoof model is
+# not trusted: a real face in the dark reads as "flat print texture", so a dark
+# face gets RECAPTURE ("Too dark") instead of a DENY. Same scale as MIN_BRIGHTNESS.
+MIN_FACE_BRIGHTNESS = MIN_BRIGHTNESS
+MIN_GOOD_FRAME_RATIO = 0.3  # need 3 good frames of 10 (relaxed, was 0.5)
 
 # -------------------------------------------------------------------- sessions
 SESSION_TTL_S = 180

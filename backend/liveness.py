@@ -90,6 +90,25 @@ def _fx_preprocess(img: np.ndarray, model_img_size: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def face_brightness(detections: List[Detection]) -> Optional[float]:
+    """Mean grey level inside the face box, averaged over the detected frames.
+
+    The passive anti-spoof model reads an underexposed real face as flat,
+    print-like texture, so a dark face must not be vetoed as a spoof -- the
+    caller turns a low value into RECAPTURE ("Too dark") instead.
+    """
+    values = []
+    for frame_bgr, (x, y, w, h) in detections[:config.ANTISPOOF_FRAMES]:
+        fh, fw = frame_bgr.shape[:2]
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(fw, int(x + w)), min(fh, int(y + h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = frame_bgr[y1:y2, x1:x2]
+        values.append(float(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).mean()))
+    return float(np.mean(values)) if values else None
+
+
 class PassiveAntiSpoof:
     """MiniFASNetV2-SE real/spoof model, loaded once at startup."""
 
@@ -302,8 +321,8 @@ class DeviceDetector:
         log.info("device detector ready (YOLO %s)", config.YOLO_MODEL.name)
 
     @staticmethod
-    def _overlap_frac(dev_xyxy, face_xywh) -> float:
-        """Intersection area / face area."""
+    def _inside_frac(dev_xyxy, face_xywh) -> float:
+        """Fraction of the FACE box that lies inside the device box (0..1)."""
         dx1, dy1, dx2, dy2 = dev_xyxy
         fx, fy, fw, fh = face_xywh
         fx2, fy2 = fx + fw, fy + fh
@@ -315,7 +334,20 @@ class DeviceDetector:
 
     def analyze(self, images: List[np.ndarray],
                 face_xywh: Tuple[int, int, int, int]) -> Tuple[bool, Optional[str]]:
+        """True only when a device is plausibly REPLAYING the face.
+
+        A replay puts the face inside the device's screen, so the test is how
+        much of the face box lies inside the device box:
+
+          * tv / laptop -> at least DEVICE_FACE_INSIDE of the face inside it, and
+            a box covering more than DEVICE_MAX_FRAME_FRAC of the frame (i.e. a
+            monitor or TV in the room) is ignored unless the face really is
+            inside it. A screen merely visible in the background never trips.
+          * cell phone  -> a looser DEVICE_FACE_OVERLAP, because a phone held up
+            next to the face is already a presentation attack.
+        """
         for img in images[:config.YOLO_FRAMES]:
+            frame_area = max(1.0, float(img.shape[0] * img.shape[1]))
             res = self.model.predict(img, imgsz=config.YOLO_IMGSZ, conf=config.YOLO_CONF,
                                      verbose=False, device="cpu")[0]
             names = res.names
@@ -323,19 +355,38 @@ class DeviceDetector:
                 label = names[int(box.cls)]
                 if label not in config.YOLO_DEVICE_CLASSES:
                     continue
-                if self._overlap_frac(box.xyxy[0].tolist(), face_xywh) >= config.DEVICE_FACE_OVERLAP:
+                dx1, dy1, dx2, dy2 = box.xyxy[0].tolist()
+                inside = self._inside_frac((dx1, dy1, dx2, dy2), face_xywh)
+                dev_frac = (max(0.0, dx2 - dx1) * max(0.0, dy2 - dy1)) / frame_area
+
+                if label == "cell phone":
+                    if inside >= config.DEVICE_FACE_OVERLAP:
+                        return True, label
+                    continue
+
+                # tv / laptop: background screens are large and do not contain
+                # the face -- both conditions must fail for it to be ignored.
+                if dev_frac > config.DEVICE_MAX_FRAME_FRAC and inside < config.DEVICE_FACE_INSIDE:
+                    log.debug("ignoring background %s (%.0f%% of frame, face %.0f%% inside)",
+                              label, dev_frac * 100, inside * 100)
+                    continue
+                if inside >= config.DEVICE_FACE_INSIDE:
                     return True, label
         return False, None
 
 
 class LivenessResult:
     def __init__(self, score: float, reasons: List[str], parts: dict,
-                 device_seen: bool, spoof_detected: bool = False):
+                 device_seen: bool, spoof_detected: bool = False,
+                 too_dark: bool = False):
         self.score = score
         self.reasons = reasons
         self.parts = parts
         self.device_seen = device_seen
         self.spoof_detected = spoof_detected
+        # The face was too dark to judge: the caller asks for a retake instead
+        # of denying a real person for bad lighting.
+        self.too_dark = too_dark
 
 
 class LivenessEngine:
@@ -413,15 +464,33 @@ class LivenessEngine:
                  + config.W_BLINK * blink)
         fused = round(float(np.clip(fused, 0.0, 1.0)), 2)
 
+        # Anti-spoof is a GATE, not just a weighted input: the liveness score
+        # used for the decision is min(passive, fused), so a low passive caps
+        # the whole score and motion can never rescue a spoof.
+        gated = round(min(passive, fused), 2)
+
         # --- hard flags -----------------------------------------------------
-        # A detected device, or a confident passive spoof, each force DENY.
-        spoof_detected = passive_avg is not None and passive_avg < config.ANTISPOOF_SPOOF_VETO
+        # A detected device, or a confident passive spoof, each force DENY --
+        # except in low light, where the passive model cannot tell a real face
+        # from a print. Then the veto is suppressed and the caller asks for a
+        # retake. The veto stays hard at normal brightness.
+        brightness = face_brightness(detections)
+        too_dark = brightness is not None and brightness < config.MIN_FACE_BRIGHTNESS
+        spoof_detected = (passive_avg is not None
+                          and passive_avg < config.ANTISPOOF_HARD_DENY
+                          and not too_dark)
+
+        device_ran = self.device.available and face_box is not None
 
         # --- reasons --------------------------------------------------------
         reasons = []
         if device_seen:
             reasons.append(f"Phone/screen detected around face ({device_label})")
-        if passive_avg is None:
+        if too_dark:
+            reasons.append(f"Face too dark to judge liveness (brightness {brightness:.0f})")
+        if spoof_detected:
+            reasons.append("Spoof detected: print/screen texture")
+        elif passive_avg is None:
             reasons.append("Passive model unavailable, liveness reduced")
         elif passive >= config.ANTISPOOF_REAL_MIN:
             reasons.append(f"Real skin texture ({passive:.2f})")
@@ -432,16 +501,25 @@ class LivenessEngine:
         reasons.append(f"Head micro-motion present ({bm['yaw_range']:.1f}deg yaw)"
                        if motion >= 0.4 else "Frames look static, possible printed photo")
 
-        log.info("liveness fused=%.2f passive=%.3f motion=%.2f blink=%.2f "
-                 "device=%s | %s", fused, passive, motion, blink,
-                 device_label or "none", timings)
+        log.info("liveness gated=%.2f (fused=%.2f) passive=%.3f motion=%.2f blink=%.2f "
+                 "device=%s spoof=%s dark=%s (face brightness %s) | %s",
+                 gated, fused, passive, motion, blink,
+                 device_label or ("clear" if device_ran else "n/a"), spoof_detected,
+                 too_dark, "n/a" if brightness is None else f"{brightness:.0f}", timings)
 
+        # device: label when detected, False when it ran and was clear, None if it
+        # could not run -- so the response always carries a device result.
+        device_report = device_label if device_seen else (False if device_ran else None)
         parts = {"passive": round(passive, 3), "passive_frames": passive_frames,
-                 "motion": round(motion, 2), "blink": round(blink, 2),
-                 "blink_detected": bm["blink_detected"], "device": device_label,
+                 "face_brightness": round(brightness, 1) if brightness is not None else None,
+                 "too_dark": too_dark,
+                 "fused": fused, "motion": round(motion, 2), "blink": round(blink, 2),
+                 "blink_detected": bm["blink_detected"], "device": device_report,
+                 "device_seen": device_seen, "device_ran": device_ran,
                  "yaw_range": bm["yaw_range"], "pitch_range": bm["pitch_range"],
                  **timings}
-        return LivenessResult(fused, reasons, parts, device_seen, spoof_detected)
+        return LivenessResult(gated, reasons, parts, device_seen, spoof_detected,
+                              too_dark)
 
     # -- active challenge ------------------------------------------------------
 

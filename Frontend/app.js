@@ -105,6 +105,14 @@ function scoreValue(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return null;
   const n=Number(value); return Math.max(0,Math.min(100,Math.round(n>=0&&n<=1?n*100:n)));
 }
+// "Liveness 87% · Match 76% · 0.6 s" -- the single small line under the message.
+function summaryLine(data) {
+  const parts=[];
+  const live=percent(data.liveness); if(live) parts.push(`Liveness ${live}`);
+  const match=percent(data.match); if(match) parts.push(`Match ${match}`);
+  if(data.time_ms!==undefined&&data.time_ms!==null) parts.push(`${(data.time_ms/1000).toFixed(1)} s`);
+  return parts.join(' · ');
+}
 function addAttempt(name, decision, ms) {
   attemptLog.unshift({time:new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),name:name||'Unknown',decision:decision||'DENY',ms});
   attemptLog=attemptLog.slice(0,10);
@@ -120,9 +128,15 @@ function showResult(data, opts={}) {
   const decision=data.decision||'DENY'; setGuide(decision);
   const root=$('viewResult'); root.classList.remove('result-allow','result-step','result-deny','result-recapture');
   root.classList.add(({ALLOW:'result-allow',STEP_UP:'result-step',DENY:'result-deny',RECAPTURE:'result-recapture'})[decision]||'result-deny');
-  const content={ALLOW:['✓','Access granted'],STEP_UP:['↗','Extra check needed'],DENY:['×','Access denied'],RECAPTURE:['↻','Please look at the camera']}[decision]||['×','Access denied'];
-  $('resultIcon').textContent=content[0]; $('resultTitle').textContent=content[1];
-  $('resultName').textContent=data.name?`Hello, ${data.name}`:'';
+  // The backend owns the wording: one title + one message per outcome. The
+  // fallbacks only cover an older backend that does not send them yet.
+  const fallback={ALLOW:['✓','Access granted'],STEP_UP:['↗','One more step'],DENY:['×','Access denied'],RECAPTURE:['↻',"Let's try again"]}[decision]||['×','Access denied'];
+  $('resultIcon').textContent=fallback[0];
+  $('resultTitle').textContent=data.title||fallback[1];
+  const message=data.message||(data.reasons||[])[0]||'';
+  $('resultMessage').textContent=message; $('resultMessage').hidden=!message;
+  $('resultSummary').textContent=summaryLine(data);
+  $('resultDetails').open=false;
   $('liveMetric').textContent=percent(data.liveness)??'—'; $('matchMetric').textContent=percent(data.match)??'—';
   $('timeMetric').textContent=data.time_ms!==undefined?`${data.time_ms} ms`:'—';
   $('scheduleReason').hidden=!data.schedule_reason; $('scheduleReason').textContent=data.schedule_reason||'';
@@ -140,7 +154,7 @@ function showResult(data, opts={}) {
   showView('result'); $('stepLabel').textContent='ACCESS DECISION';
   const fromOtp=!!opts.fromOtp;
   addAttempt(data.name||activeUser,decision,data.time_ms);
-  if(decision!=='STEP_UP'||fromOtp) autoHomeTimeout=setTimeout(goHome,6000);
+  if(decision!=='STEP_UP'||fromOtp) autoHomeTimeout=setTimeout(goHome,20000);
 }
 function showMessage(title,text) { stopBusy();requestInProgress=false;$('messageTitle').textContent=title;$('messageText').textContent=text;showView('message'); }
 function goHome() {
@@ -159,8 +173,8 @@ async function beginVerify() {
 async function continueDecision(data) {
   latestResponse=data; $('debugJson').textContent=JSON.stringify(data,null,2);
   if(data.decision==='STEP_UP') stepUpResponse=data;
-  if(data.decision==='STEP_UP'&&data.challenge){activeSession=data.session_id||activeSession;$('challengeText').textContent=data.challenge.text||'Please complete the challenge';$('countdown').hidden=true;showView('challenge');setGuide('STEP_UP');setHint('Follow the on-screen instruction');requestInProgress=false;return;}
-  if(data.totp_required){activeSession=data.session_id||activeSession;showView('otp');setGuide('STEP_UP');setHint('Complete authenticator verification');requestInProgress=false;return;}
+  if(data.decision==='STEP_UP'&&data.challenge){activeSession=data.session_id||activeSession;$('challengeText').textContent=data.message||data.challenge.text||'Please complete the challenge';$('countdown').hidden=true;showView('challenge');setGuide('STEP_UP');setHint('Follow the on-screen instruction');requestInProgress=false;return;}
+  if(data.totp_required){activeSession=data.session_id||activeSession;if(data.message)$('otpLede').textContent=data.message;showView('otp');setGuide('STEP_UP');setHint('Complete authenticator verification');requestInProgress=false;return;}
   showResult(data);
 }
 async function beginChallenge() {
@@ -185,9 +199,28 @@ async function beginEnroll() {
     const frames=await captureBurst(5,200);const data=await post('/enroll',{name,frames});
     $('debugJson').textContent=JSON.stringify(data,null,2);latestResponse=data;
     if(!data.ok) throw new Error(data.reason||'Enrollment could not be completed.');
-    activeUser=data.name||name;$('qrImage').src=data.totp_qr;$('enrolledName').textContent=`Authenticator enrolled for ${activeUser}`;showView('enrollment');setHint('Enrollment complete');
+    activeUser=data.name||name;$('qrImage').src=data.totp_qr;
+    $('enrollSetup').hidden=false;$('enrollComplete').hidden=true;$('confirmCodeInput').value='';$('confirmError').hidden=true;
+    showView('enrollment');setHint('Scan the QR code, then enter the 6-digit code');$('confirmCodeInput').focus();
   } catch(error){$('enrollError').textContent=error.message;$('enrollError').hidden=false;showView('register');}
   finally{requestInProgress=false;$('enrollBtn').disabled=false;}
+}
+async function confirmEnroll() {
+  const code=$('confirmCodeInput').value.replace(/\D/g,'');$('confirmError').hidden=true;
+  if(code.length!==6){$('confirmError').textContent='Enter all 6 digits.';$('confirmError').hidden=false;return;}
+  if(!backendOnline){$('confirmError').textContent='The access server is offline. Try again when it is online.';$('confirmError').hidden=false;return;}
+  if(requestInProgress)return;requestInProgress=true;$('confirmEnrollBtn').disabled=true;
+  try {
+    const data=await post('/enroll/confirm',{name:activeUser,code});
+    $('debugJson').textContent=JSON.stringify(data,null,2);
+    if(data.ok){
+      $('enrolledName').textContent=`${activeUser} can now use this kiosk`;
+      $('enrollSetup').hidden=true;$('enrollComplete').hidden=false;setHint('Registration complete');
+    } else {
+      $('confirmError').textContent="Code didn't match — try again";$('confirmError').hidden=false;
+    }
+  } catch(error){$('confirmError').textContent=error.message;$('confirmError').hidden=false;}
+  finally{requestInProgress=false;$('confirmEnrollBtn').disabled=false;}
 }
 async function submitOtp() {
   const code=$('otpInput').value.replace(/\D/g,'');$('otpError').hidden=true;
@@ -214,6 +247,9 @@ $('verifyBtn').addEventListener('click',beginVerify);
 $('registerBtn').addEventListener('click',()=>{showView('register');$('nameInput').focus();});
 $('enrollBtn').addEventListener('click',beginEnroll);
 $('nameInput').addEventListener('keydown',e=>{if(e.key==='Enter')beginEnroll();});
+$('confirmEnrollBtn').addEventListener('click',confirmEnroll);
+$('confirmCodeInput').addEventListener('input',()=>{$('confirmCodeInput').value=$('confirmCodeInput').value.replace(/\D/g,'').slice(0,6);});
+$('confirmCodeInput').addEventListener('keydown',e=>{if(e.key==='Enter')confirmEnroll();});
 $('challengeBtn').addEventListener('click',beginChallenge);
 $('otpBtn').addEventListener('click',submitOtp);
 $('otpInput').addEventListener('input',()=>{$('otpInput').value=$('otpInput').value.replace(/\D/g,'').slice(0,6);});
@@ -227,5 +263,16 @@ document.addEventListener('keydown',e=>{
   if(e.key.toLowerCase()==='f'&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName))$('demoMenu').hidden=!$('demoMenu').hidden;
   if(e.key==='Escape'){ $('debugPanel').hidden=true;$('demoMenu').hidden=true; }
 });
+
+// Small manual "Done" button on the result card (auto-return is now 20s).
+(function addResultDoneButton(){
+  const resultView=$('viewResult'); if(!resultView||$('resultDoneBtn'))return;
+  const btn=document.createElement('button');
+  btn.id='resultDoneBtn'; btn.type='button'; btn.textContent='Done';
+  btn.className='btn'; btn.style.cssText='margin-top:10px;padding:6px 20px;font-size:0.85rem;opacity:0.85;';
+  btn.addEventListener('click',goHome);
+  const anchor=resultView.querySelector('.result-home');
+  if(anchor&&anchor.parentNode)anchor.parentNode.appendChild(btn); else resultView.appendChild(btn);
+})();
 
 startCamera();pollHealth();setInterval(pollHealth,5000);
