@@ -21,7 +21,10 @@ import config  # noqa: E402
 ZOO = "https://github.com/opencv/opencv_zoo/raw/main/models"
 FACENOX = "https://raw.githubusercontent.com/facenox/face-antispoof-onnx/main/models"
 MODELS = [
+    # Passive anti-spoof: INT8 primary, fp32 fallback. The published top-level
+    # quantized model is the 98.20 variant; the matching fp32 lives in best/98.20/.
     (f"{FACENOX}/best_model_quantized.onnx", config.ANTISPOOF_MODEL),
+    (f"{FACENOX}/best/98.20/best_model.onnx", config.ANTISPOOF_MODEL_FP32),
     (f"{ZOO}/face_detection_yunet/face_detection_yunet_2023mar.onnx",
      config.YUNET_MODEL),
     (f"{ZOO}/face_recognition_sface/face_recognition_sface_2021dec.onnx",

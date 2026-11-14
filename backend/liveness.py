@@ -99,15 +99,18 @@ class PassiveAntiSpoof:
 
     def load(self):
         import ort_utils
-        if not config.ANTISPOOF_MODEL.exists():
-            log.error("anti-spoof model missing at %s -- run: python tools/fetch_models.py. "
-                      "Passive liveness will be neutral until then.", config.ANTISPOOF_MODEL)
+        # Prefer the INT8 model; fall back to the fp32 one if it is missing.
+        path = next((p for p in (config.ANTISPOOF_MODEL, config.ANTISPOOF_MODEL_FP32)
+                     if p.exists()), None)
+        if path is None:
+            log.error("anti-spoof model missing in %s -- run: python tools/fetch_models.py. "
+                      "Passive liveness will be neutral until then.", config.MODEL_DIR)
             return
-        self.session = ort_utils.make_session(config.ANTISPOOF_MODEL)
+        self.session = ort_utils.make_session(path)
         self.input_name = self.session.get_inputs()[0].name
         self.available = True
-        log.info("passive anti-spoof ready (MiniFASNetV2-SE, %dx%d)",
-                 config.ANTISPOOF_INPUT, config.ANTISPOOF_INPUT)
+        log.info("passive anti-spoof ready (MiniFASNetV2-SE, %dx%d, %s)",
+                 config.ANTISPOOF_INPUT, config.ANTISPOOF_INPUT, path.name)
 
     def _real_probs(self, crops_chw: np.ndarray) -> np.ndarray:
         """Batch of (N,3,H,W) -> real probability per crop via softmax over logits."""

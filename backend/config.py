@@ -58,7 +58,8 @@ MATCH_THRESHOLDS = {
 # 128x128 RGB input, output logits [real, spoof]. Crop + preprocess copied
 # verbatim from that repo (see liveness.py) -- do not "improve" them, the model
 # was trained against that exact pipeline.
-ANTISPOOF_MODEL = MODEL_DIR / "best_model_quantized.onnx"
+ANTISPOOF_MODEL = MODEL_DIR / "best_model_quantized.onnx"   # INT8, primary
+ANTISPOOF_MODEL_FP32 = MODEL_DIR / "best_model.onnx"        # fp32, fallback
 ANTISPOOF_INPUT = 128
 ANTISPOOF_BBOX_EXPANSION = 1.5   # facenox default; the model expects this context
 ANTISPOOF_FRAMES = 3             # run on the 3 sharpest detected frames of the burst
