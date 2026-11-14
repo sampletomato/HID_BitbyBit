@@ -108,6 +108,16 @@ MIN_GOOD_FRAME_RATIO = 0.5  # at least half the burst must pass
 SESSION_TTL_S = 180
 MAX_CHALLENGE_ATTEMPTS = 2
 
+# ------------------------------------------------- active challenge detection
+# Verified from the ~20 challenge frames using the MediaPipe landmarks.
+CHALLENGE_BLINKS_REQUIRED = 2    # BLINK_TWICE
+CHALLENGE_YAW_DEG = 12.0         # TURN_LEFT / TURN_RIGHT: head yaw magnitude
+# Sign convention: with this = -1, the user's left turn reads as negative yaw.
+# If a live test shows left/right swapped, flip to +1 (one-line change).
+CHALLENGE_YAW_LEFT_SIGN = -1
+SMILE_RATIO_DELTA = 0.12         # SMILE: rise in mouth-width / inter-eye-width
+SMILE_MIN_RATIO = 1.55           # or an absolute wide-mouth ratio
+
 # ------------------------------------------------------------------------ TOTP
 TOTP_ISSUER = "HID Kiosk"
 TOTP_DIGITS = 6

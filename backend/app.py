@@ -124,6 +124,7 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
               reasons: List[str], t0: float, session_id: str,
               challenge: Optional[dict] = None, totp_required: bool = False,
               schedule_reason: str = SCHEDULE_PENDING,
+              scores: Optional[dict] = None,
               extra: Optional[dict] = None) -> dict:
     elapsed = int((time.time() - t0) * 1000)
     if elapsed > config.TARGET_MS:
@@ -137,6 +138,7 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
         "schedule_reason": schedule_reason,
         "totp_required": totp_required,
         "reasons": reasons,
+        "scores": scores or {},      # per-signal breakdown for the demo panel
         "time_ms": elapsed,
         "session_id": session_id,
         "challenge": challenge,
@@ -144,6 +146,17 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
     if extra:
         body.update(extra)
     return body
+
+
+def _scores(live, match: float) -> dict:
+    """Flatten the per-signal liveness parts + match into one small dict."""
+    p = live.parts
+    return {"passive": p.get("passive"), "motion": p.get("motion"),
+            "blink": p.get("blink"), "blink_detected": p.get("blink_detected"),
+            "device": p.get("device"), "yaw_range": p.get("yaw_range"),
+            "match": round(match, 2),
+            "latency_ms": {k: p[k] for k in ("passive_ms", "blinkmotion_ms", "device_ms")
+                           if k in p}}
 
 
 def _apply_force(verdict: str) -> str:
@@ -219,7 +232,7 @@ def verify(req: VerifyRequest):
         state.sessions[sid]["challenge"] = challenge
 
     return _response(verdict, name, live.score, match, reasons + live.reasons,
-                     t0, sid, challenge)
+                     t0, sid, challenge, scores=_scores(live, match))
 
 
 @app.post("/challenge")
@@ -234,40 +247,54 @@ def challenge(req: ChallengeRequest):
                          ["Session expired, please start again"], t0, req.session_id)
 
     expected = session.get("challenge") or rng.choice(config.CHALLENGES)
-    session["attempts"] += 1
+    enrolled = session["name"]
 
     images = face_mod.decode_frames(req.frames)
     quality = face_mod.assess_quality(images, config.MIN_FRAMES_CHALLENGE)
     if not quality.ok:
-        return _response(_apply_force(dec.RECAPTURE), session["name"], session["liveness"],
+        return _response(_apply_force(dec.RECAPTURE), enrolled, session["liveness"],
                          session["match"], [quality.reason], t0, req.session_id,
                          challenge=expected)
 
-    passed, chal_score, reasons = state.liveness.check_challenge(
-        expected["action"], images, rng)
+    # Re-check identity and anti-spoof on the challenge frames (not just the action).
+    name, match, burst = state.face.identify(images)
+    if burst.query is None:
+        return _response(_apply_force(dec.RECAPTURE), enrolled, 0.0, 0.0,
+                         [burst.note], t0, req.session_id, challenge=expected)
+    passive_avg, _, _ = state.liveness.passive.score_detections(burst.detections)
+    spoof = passive_avg is not None and passive_avg < config.ANTISPOOF_SPOOF_VETO
+
+    # Did they perform the requested action?
+    passed, chal_score, chal_reasons = state.liveness.check_challenge(expected["action"], images)
+    same_person = name == enrolled and match >= state.face.match_allow
+
+    scores = {"passive": round(passive_avg, 3) if passive_avg is not None else None,
+              "match": round(match, 2), "challenge": chal_score}
+
+    # A spoof or a different face during the challenge is a hard DENY.
+    if spoof:
+        return _response(_apply_force(dec.DENY), enrolled, session["liveness"], match,
+                         chal_reasons + [f"Print/screen texture detected ({passive_avg:.2f})"],
+                         t0, req.session_id, scores=scores)
+    if not same_person:
+        return _response(_apply_force(dec.DENY), enrolled, session["liveness"], match,
+                         chal_reasons + ["Face no longer matches the enrolled user"],
+                         t0, req.session_id, scores=scores)
 
     if passed:
-        # Passing the challenge lifts liveness confidence above the ALLOW bar.
-        boosted = max(session["liveness"], config.LIVENESS_ALLOW + 0.05)
-        session["liveness"] = boosted
-        verdict, dec_reasons = dec.decide(boosted, session["match"], session["name"],
-                                          state.face.match_allow, state.face.match_deny)
-        return _response(_apply_force(verdict), session["name"], boosted,
-                         session["match"], reasons + dec_reasons, t0, req.session_id)
+        live_score = max(session["liveness"], config.LIVENESS_ALLOW + 0.05)
+        session["liveness"] = live_score
+        log.info("challenge '%s' passed for %s", expected["action"], enrolled)
+        return _response(_apply_force(dec.ALLOW), enrolled, live_score, match,
+                         chal_reasons + [f"Identity confirmed as {enrolled} ({match:.2f})"],
+                         t0, req.session_id, scores=scores)
 
-    if session["attempts"] < config.MAX_CHALLENGE_ATTEMPTS:
-        retry = rng.choice(config.CHALLENGES)
-        session["challenge"] = retry
-        return _response(_apply_force(dec.STEP_UP), session["name"], session["liveness"],
-                         session["match"], reasons + ["Please try one more challenge"],
-                         t0, req.session_id, challenge=retry)
-
+    # Action failed -> fall back to TOTP.
     session["totp_required"] = True
-    log.info("challenge exhausted for %s, TOTP required", session["name"])
-    return _response(_apply_force(dec.STEP_UP), session["name"], session["liveness"],
-                     session["match"],
-                     reasons + ["Challenge failed, enter the code from your authenticator app"],
-                     t0, req.session_id, totp_required=True)
+    log.info("challenge '%s' failed for %s, TOTP required", expected["action"], enrolled)
+    return _response(_apply_force(dec.STEP_UP), enrolled, session["liveness"], match,
+                     chal_reasons + ["Challenge not completed, enter the code from your authenticator app"],
+                     t0, req.session_id, totp_required=True, scores=scores)
 
 
 @app.post("/otp")

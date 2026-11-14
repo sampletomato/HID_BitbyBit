@@ -249,6 +249,36 @@ class BlinkMotion:
                 "yaw_range": round(yaw_range, 2), "pitch_range": round(pitch_range, 2),
                 "frames_with_face": len(ears)}
 
+    def landmark_series(self, images: List[np.ndarray]) -> List[dict]:
+        """Per-frame {ear, yaw, mouth_ratio} for active-challenge checking.
+
+        mouth_ratio = mouth corner width / inter-eye width, so it is scale and
+        distance invariant -- a smile widens it.
+        """
+        import mediapipe as mp
+        series = []
+        for img in images:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            res = self.landmarker.detect(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+            if not res.face_landmarks:
+                continue
+            h, w = img.shape[:2]
+            lms = res.face_landmarks[0]
+
+            def px(i):
+                return np.array([lms[i].x * w, lms[i].y * h], dtype=np.float32)
+
+            eye = np.array([px(i) for i in (*_LEFT_EYE, *_RIGHT_EYE)])
+            ear = (_ear(eye[:6]) + _ear(eye[6:])) / 2.0
+            yaw = 0.0
+            if res.facial_transformation_matrixes:
+                yaw, _ = _yaw_pitch_deg(res.facial_transformation_matrixes[0])
+            inter_eye = float(np.linalg.norm(px(33) - px(263))) or 1.0
+            mouth = float(np.linalg.norm(px(61) - px(291))) / inter_eye
+            series.append({"ear": ear, "yaw": yaw, "mouth_ratio": mouth})
+        return series
+
 
 class DeviceDetector:
     """YOLO (ultralytics): phone / laptop / tv overlapping the face box."""
@@ -415,15 +445,48 @@ class LivenessEngine:
 
     # -- active challenge ------------------------------------------------------
 
-    def check_challenge(self, action: str, images: List[np.ndarray],
-                        rng: random.Random) -> Tuple[bool, float, List[str]]:
-        """Did the user perform the requested action?
+    def check_challenge(self, action: str,
+                        images: List[np.ndarray]) -> Tuple[bool, float, List[str]]:
+        """Did the user perform the requested action? Real landmark detection.
 
-        STUB-STEP5: FaceMesh landmark tracking per action (eye-aspect-ratio for
-        BLINK_TWICE, yaw for TURN_*, mouth corners for SMILE).
+        BLINK_TWICE -> count EAR dips; TURN_LEFT/RIGHT -> head yaw magnitude and
+        direction; SMILE -> rise in mouth-width / inter-eye-width.
         """
-        passed = rng.random() < 0.75
-        score = round(rng.uniform(0.76, 0.95) if passed else rng.uniform(0.25, 0.55), 2)
-        label = action.replace("_", " ").lower()
-        reasons = [f"Challenge '{label}' {'completed' if passed else 'not completed'}"]
-        return passed, score, reasons
+        if not self.blinkmotion.available:
+            return False, 0.0, ["Landmark model unavailable"]
+
+        series = self.blinkmotion.landmark_series(images)
+        if len(series) < 3:
+            return False, 0.0, ["Could not track your face during the challenge"]
+
+        ears = [s["ear"] for s in series]
+        yaws = [s["yaw"] for s in series]
+        mouths = [s["mouth_ratio"] for s in series]
+
+        if action == "BLINK_TWICE":
+            blinks, closed = 0, False
+            for e in ears:
+                if e < config.EAR_BLINK_THRESHOLD and not closed:
+                    blinks += 1
+                    closed = True
+                elif e >= config.EAR_BLINK_THRESHOLD:
+                    closed = False
+            passed = blinks >= config.CHALLENGE_BLINKS_REQUIRED
+            score = min(1.0, blinks / config.CHALLENGE_BLINKS_REQUIRED)
+            return passed, round(score, 2), [f"Detected {blinks} blink(s)"]
+
+        if action in ("TURN_LEFT", "TURN_RIGHT"):
+            want_left = action == "TURN_LEFT"
+            sign = config.CHALLENGE_YAW_LEFT_SIGN if want_left else -config.CHALLENGE_YAW_LEFT_SIGN
+            reached = min(yaws) if sign < 0 else max(yaws)
+            passed = (sign * reached) >= config.CHALLENGE_YAW_DEG
+            score = min(1.0, abs(reached) / config.CHALLENGE_YAW_DEG)
+            return passed, round(score, 2), [f"Head yaw reached {reached:.0f}deg"]
+
+        if action == "SMILE":
+            rise = max(mouths) - min(mouths)
+            passed = rise >= config.SMILE_RATIO_DELTA or max(mouths) >= config.SMILE_MIN_RATIO
+            score = min(1.0, rise / config.SMILE_RATIO_DELTA)
+            return passed, round(score, 2), [f"Mouth widened by {rise:.2f}"]
+
+        return False, 0.0, [f"Unknown challenge '{action}'"]
