@@ -166,6 +166,20 @@ def _apply_force(verdict: str) -> str:
 
 # ------------------------------------------------------------------- endpoints
 
+@app.get("/")
+def root():
+    """Friendly status page -- this is the API, the kiosk UI is the frontend."""
+    return {
+        "service": "HID Face Liveness Kiosk API",
+        "ok": True,
+        "mode": config.MODE,
+        "face_backend": state.face.backend_name,
+        "note": "This is the API only. Open the frontend (Frontend/index.html) for the kiosk UI.",
+        "endpoints": ["GET /health", "POST /enroll", "POST /verify",
+                      "POST /challenge", "POST /otp", "GET /docs"],
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "mode": config.MODE, "face_backend": state.face.backend_name}
