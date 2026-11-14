@@ -75,6 +75,17 @@ async function api(path, options={}) {
 }
 async function post(path, body) { return api(path,{method:'POST',body:JSON.stringify(body)}); }
 
+// Demo clock. The backend applies the campus schedule at `sim_time` when one
+// is sent, so the ALLOW / STEP_UP / DENY rules can be shown on demand. Empty
+// field = omit the field entirely = the backend uses the real clock.
+function simTime() { return ($('simTime')?.value || '').trim(); }
+function withSim(body) { const t=simTime(); return t?{...body,sim_time:t}:body; }
+function refreshSimStatus() {
+  const t=simTime(); const status=$('simStatus');
+  status.textContent = t ? `Simulating ${t.replace('T',' ')}` : 'Using the real clock';
+  status.classList.toggle('active',!!t);
+}
+
 async function pollHealth() {
   try {
     const health = await api('/health');
@@ -167,7 +178,7 @@ async function beginVerify() {
   if(requestInProgress)return;
   if(!backendOnline){showMessage('Server offline','The access server is unavailable. No entry decision can be made. Please try again when it is online.');return;}
   requestInProgress=true; startBusy('Checking<br><span>liveness.</span>','Keep looking at the camera.');setHint('Hold still while your face is checked');
-  try { const frames=await captureBurst(10,100); $('busyText').textContent='Comparing your face and checking liveness.'; const data=await post('/verify',{frames});activeUser=data.name||'';activeSession=data.session_id||'';await continueDecision(data); }
+  try { const frames=await captureBurst(10,100); $('busyText').textContent='Comparing your face and checking liveness.'; const data=await post('/verify',withSim({frames}));activeUser=data.name||'';activeSession=data.session_id||'';await continueDecision(data); }
   catch(error){showMessage('Verification unavailable',error.message);}
 }
 async function continueDecision(data) {
@@ -185,7 +196,7 @@ async function beginChallenge() {
     for(let n=3;n>=1;n--){$('countdown').textContent=n;await sleep(650);}
     $('countdown').hidden=true;startBusy('Completing<br><span>challenge.</span>','Keep following the instruction.');
     const frames=await captureBurst(20,100);$('busyText').textContent='Checking challenge response.';
-    const data=await post('/challenge',{session_id:activeSession,frames});await continueDecision(data);
+    const data=await post('/challenge',withSim({session_id:activeSession,frames}));await continueDecision(data);
   } catch(error){showMessage('Challenge unavailable',error.message);} finally {$('challengeBtn').disabled=false;$('countdown').hidden=true;}
 }
 async function beginEnroll() {
@@ -227,9 +238,9 @@ async function submitOtp() {
   if(code.length!==6){$('otpError').textContent='Enter all 6 digits.';$('otpError').hidden=false;return;}
   if(requestInProgress)return;requestInProgress=true;$('otpBtn').disabled=true;
   try {
-    const data=await post('/otp',{session_id:activeSession,code});
+    const data=await post('/otp',withSim({session_id:activeSession,code}));
     latestResponse=data;$('debugJson').textContent=JSON.stringify(data,null,2);
-    showResult({...data,liveness:stepUpResponse?.liveness,match:stepUpResponse?.match,time_ms:stepUpResponse?.time_ms,schedule_reason:stepUpResponse?.schedule_reason,reasons:[data.reason].filter(Boolean),scores:stepUpResponse?.scores},{fromOtp:true});
+    showResult({...data,liveness:stepUpResponse?.liveness,match:stepUpResponse?.match,time_ms:stepUpResponse?.time_ms,schedule_reason:data.schedule_reason||stepUpResponse?.schedule_reason,reasons:[data.reason].filter(Boolean),scores:stepUpResponse?.scores},{fromOtp:true});
   } catch(error){$('otpError').textContent=error.message;$('otpError').hidden=false;requestInProgress=false;}
   finally{$('otpBtn').disabled=false;}
 }
@@ -257,6 +268,9 @@ $('otpInput').addEventListener('keydown',e=>{if(e.key==='Enter')submitOtp();});
 $('demoCodeBtn').addEventListener('click',showDemoCode);
 document.querySelectorAll('[data-home]').forEach(button=>button.addEventListener('click',goHome));
 document.querySelectorAll('[data-force]').forEach(button=>button.addEventListener('click',()=>setForce(button.dataset.force)));
+$('simTime').addEventListener('change',refreshSimStatus);
+$('simClear').addEventListener('click',()=>{$('simTime').value='';refreshSimStatus();});
+refreshSimStatus();
 $('closeDebug').addEventListener('click',()=>$('debugPanel').hidden=true);
 document.addEventListener('keydown',e=>{
   if(e.key.toLowerCase()==='d'&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName))$('debugPanel').hidden=!$('debugPanel').hidden;

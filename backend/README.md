@@ -5,11 +5,12 @@ FastAPI service implementing the shared API contract.
 **Real so far:** frame decode, quality gate, **InsightFace buffalo_l face
 recognition** (YuNet+SFace fallback), a full **liveness stack** (passive
 anti-spoof + MediaPipe blink/head-motion + YOLO device-in-frame), the decision
-policy, and **TOTP** step-up.
+policy, **TOTP** step-up, and the **campus access schedule** (a live,
+recognised person is still only authorised inside their window).
 
 Two run modes via `MODE` (one codebase):
 - `MODE=edge` (default) — kiosk laptop, runs the face models.
-- `MODE=central` — EC2, owns the schedule + audit log, no face models. *(wired in step 3)*
+- `MODE=central` — EC2, owns the audit log, no face models. *(audit in step 4)*
 
 ## Run (Linux / EC2)
 
@@ -113,6 +114,10 @@ fetched by `tools/fetch_models.py` (`face_landmarker.task`, `yolov8n.pt`).
 | POST | `/challenge` | check an active challenge from a ~2 s, 20-frame burst |
 | POST | `/otp` | TOTP step-up check |
 
+`/verify`, `/challenge` and `/otp` also accept an optional `"sim_time"` (ISO
+datetime, e.g. `"2026-11-16T18:20"`): the schedule is then applied at that
+wall-clock moment instead of now. Demo only — it changes nothing biometric.
+
 Frames are 640×480 JPEG (quality 0.8) base64 data-URL strings. Bare base64
 without the `data:image/jpeg;base64,` prefix is also accepted.
 
@@ -139,9 +144,39 @@ for Google Authenticator. `totp_secret` is also returned while `DEV_MODE=1`.
 `/otp` takes `{session_id, code}` and checks a TOTP code (`pyotp`), with replay
 protection and a ±1 step skew window.
 
-> **Renamed:** the old `VERIFY` decision is now `STEP_UP`. `schedule_reason` is a
-> placeholder until schedule enforcement lands in step 3; `mode` is always
+> **Renamed:** the old `VERIFY` decision is now `STEP_UP`. `mode` is always
 > `online` until the offline fail-safe lands in step 4.
+
+## Access schedule
+
+Biometrics answer *"is this really Divya, live, at the kiosk?"*; the schedule
+answers *"is Divya allowed into this zone right now?"*. `policy.py` folds the
+second into the first, and can only ever restrict:
+
+| biometric | schedule | final |
+|---|---|---|
+| `ALLOW` | inside the window | `ALLOW` |
+| `ALLOW` | within `SCHEDULE_GRACE_MIN` (30) of it | `STEP_UP` — authenticator code only, no face challenge (`SCHEDULE_GRACE`) |
+| any | outside / wrong zone / expired / no row | `DENY` (`SCHEDULE_DENY`) |
+| `STEP_UP` | allows | challenge as before, then the schedule is re-checked on the pass |
+| `DENY` | anything | `DENY` — a schedule never upgrades a denial |
+
+Every response carries `schedule_reason` in plain words, e.g.
+`"Lab B · Mon–Fri 09:00–18:00"`.
+
+**Source.** The Supabase table `schedules(user_name, zone, days, start_time,
+end_time, valid_until)`, read over its REST API using `SUPABASE_URL` /
+`SUPABASE_SERVICE_KEY` from `backend/.env` (see `.env.example`; the real file is
+git-ignored and the keys are never logged). If Supabase is unset or unreachable
+it falls back to `backend/schedule.json`, same shape, so the demo works offline.
+Rows are cached for 60 s.
+
+Which door this kiosk guards is `KIOSK_ZONE` in `config.py` (`lab_b`); a row
+only counts when its `zone` matches.
+
+```bash
+python tools/smoke_schedule.py    # the rules, no camera needed
+```
 
 ## Dev helpers
 

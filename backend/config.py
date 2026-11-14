@@ -7,6 +7,16 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# backend/.env holds the Supabase credentials (SUPABASE_URL,
+# SUPABASE_SERVICE_KEY). It is read here, before anything calls os.getenv, and
+# is never committed -- see .gitignore. Missing file is fine: policy.py then
+# falls back to backend/schedule.json.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:          # python-dotenv not installed: env vars only
+    pass
 STORE_DIR = BASE_DIR / "store"
 MODEL_DIR = BASE_DIR / "models"
 STORE_DIR.mkdir(exist_ok=True)
@@ -19,6 +29,16 @@ MODE = os.getenv("MODE", "edge").strip().lower()
 # Dev mode exposes /dev/* helper routes and returns the TOTP secret in plain
 # text so the demo can show it. Set DEV_MODE=0 on EC2 for the final demo.
 DEV_MODE = os.getenv("DEV_MODE", "1") == "1"
+
+# ------------------------------------------------------------ access schedule
+# Which door this kiosk guards. A schedule row only counts when its `zone`
+# matches this value, so one gallery can serve several kiosks.
+KIOSK_ZONE = os.getenv("KIOSK_ZONE", "lab_b").strip()
+
+# Minutes before the start / after the end of a window that still count as
+# "nearly on time": inside this band a biometric ALLOW becomes a STEP_UP for an
+# authenticator code instead of a flat DENY.
+SCHEDULE_GRACE_MIN = int(os.getenv("SCHEDULE_GRACE_MIN", "30"))
 
 # ----------------------------------------------------------------- face models
 # "auto" tries InsightFace buffalo_l, then falls back to OpenCV YuNet + SFace.

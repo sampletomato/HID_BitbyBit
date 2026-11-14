@@ -8,6 +8,7 @@ env/
 # --- secrets / config ---
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 

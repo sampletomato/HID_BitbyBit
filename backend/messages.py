@@ -25,6 +25,10 @@ RECAPTURE_DARK = "RECAPTURE_DARK"
 RECAPTURE_STILL = "RECAPTURE_STILL"
 RECAPTURE_CLOSER = "RECAPTURE_CLOSER"
 RECAPTURE_BRIGHT = "RECAPTURE_BRIGHT"
+# Schedule outcomes (policy.py): the person is live and recognised, but the
+# campus access schedule has the last word.
+SCHEDULE_DENY = "SCHEDULE_DENY"
+SCHEDULE_GRACE = "SCHEDULE_GRACE"
 
 COPY = {
     ALLOW:                    (dec.ALLOW, "Welcome, {name}", "Identity verified."),
@@ -42,6 +46,11 @@ COPY = {
     RECAPTURE_STILL:          (dec.RECAPTURE, "Let's try again", "Hold still"),
     RECAPTURE_CLOSER:         (dec.RECAPTURE, "Let's try again", "Move closer"),
     RECAPTURE_BRIGHT:         (dec.RECAPTURE, "Let's try again", "Too bright"),
+    SCHEDULE_DENY:            (dec.DENY, "Access denied",
+                               "You're not authorised to enter at this time."),
+    SCHEDULE_GRACE:           (dec.STEP_UP, "One more step",
+                               "Outside your usual hours — enter your "
+                               "authenticator code."),
 }
 
 # Fallback per verdict, used when no specific code fits (or a /dev/force

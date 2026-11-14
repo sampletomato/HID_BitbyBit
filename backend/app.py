@@ -7,6 +7,9 @@ Implements the shared frontend/backend contract:
     POST /challenge   -> active challenge check, falls back to TOTP
     POST /otp         -> TOTP check
 
+/verify, /challenge and /otp all accept an optional "sim_time" (ISO datetime)
+so the demo can show the campus schedule rules without waiting for the clock.
+
 Dev-only helpers (DEV_MODE=1, the default):
     GET  /dev/users
     GET  /dev/force?decision=ALLOW|STEP_UP|DENY|RECAPTURE|off
@@ -32,14 +35,17 @@ import decision as dec
 import face as face_mod
 import liveness as liveness_mod
 import messages as msg
+import policy
 import totp as totp_mod
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
-# Step 3 replaces this with a real schedule lookup via policy.py.
-SCHEDULE_PENDING = "Schedule enforcement not yet enabled"
+# Shown while no user is identified yet (a retake, an unknown face): the zone
+# this kiosk guards, without claiming anything about a schedule we cannot look
+# up. Once a name is known, policy.py supplies the real line.
+ZONE_LINE = f"{policy.zone_label(config.KIOSK_ZONE)} {policy.DOT} access schedule applies"
 
 
 # ------------------------------------------------------------------- app state
@@ -140,16 +146,20 @@ class EnrollConfirmRequest(BaseModel):
 
 class VerifyRequest(BaseModel):
     frames: List[str] = Field(default_factory=list)
+    # Demo only: pretend it is this wall-clock time when applying the schedule.
+    sim_time: Optional[str] = None
 
 
 class ChallengeRequest(BaseModel):
     session_id: str
     frames: List[str] = Field(default_factory=list)
+    sim_time: Optional[str] = None
 
 
 class OtpRequest(BaseModel):
     session_id: str
     code: str
+    sim_time: Optional[str] = None
 
 
 # -------------------------------------------------------------------- helpers
@@ -157,7 +167,7 @@ class OtpRequest(BaseModel):
 def _response(verdict: str, name: Optional[str], liveness: float, match: float,
               reasons: List[str], t0: float, session_id: str,
               challenge: Optional[dict] = None, totp_required: bool = False,
-              schedule_reason: str = SCHEDULE_PENDING,
+              schedule_reason: Optional[str] = None,
               scores: Optional[dict] = None,
               reason_code: Optional[str] = None,
               extra: Optional[dict] = None) -> dict:
@@ -165,9 +175,11 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
     if elapsed > config.TARGET_MS:
         log.warning("over budget: %d ms (target %d ms)", elapsed, config.TARGET_MS)
 
-    # One clear sentence for the kiosk. A pending TOTP always wins the copy, so
-    # the screen asks for the code rather than repeating the challenge.
-    if verdict == dec.STEP_UP and totp_required:
+    # One clear sentence for the kiosk. A pending TOTP normally wins the copy, so
+    # the screen asks for the code rather than repeating the challenge -- except
+    # for the schedule grace band, which has its own wording and also wants a code.
+    if (verdict == dec.STEP_UP and totp_required
+            and reason_code != msg.SCHEDULE_GRACE):
         reason_code = msg.STEP_UP_TOTP
     code = msg.code_for(verdict, reason_code)
     title, message = msg.render(code, name=name,
@@ -182,7 +194,7 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
         "liveness": round(liveness, 2),
         "match": round(match, 2),
         "mode": "online",            # step 4 sets this from the central link state
-        "schedule_reason": schedule_reason,
+        "schedule_reason": schedule_reason or ZONE_LINE,
         "totp_required": totp_required,
         "reasons": reasons,
         "scores": scores or {},      # per-signal breakdown for the demo panel
@@ -204,6 +216,37 @@ def _scores(live, match: float) -> dict:
             "match": round(match, 2),
             "latency_ms": {k: p[k] for k in ("passive_ms", "blinkmotion_ms", "device_ms")
                            if k in p}}
+
+
+# Schedule outcomes that nothing can rescue: the person may be live and
+# recognised, but they are not authorised to be here now.
+SCHEDULE_HARD_DENY = (policy.OUT_OF_WINDOW, policy.WRONG_ZONE,
+                      policy.EXPIRED, policy.NO_SCHEDULE)
+
+
+def _apply_schedule(verdict: str, name: Optional[str], sim_time: Optional[str]):
+    """Fold the campus schedule into a biometric verdict.
+
+    Returns (verdict, reason_code, schedule_reason, totp_required, reasons).
+    `reason_code` is None when the schedule had nothing to add, leaving the
+    biometric code in place. A biometric DENY/RECAPTURE never reaches here --
+    the schedule may restrict access, never grant it.
+    """
+    sched = policy.evaluate(name, policy.parse_sim_time(sim_time))
+    reasons = [f"Schedule: {sched.reason}"]
+
+    if sched.status in SCHEDULE_HARD_DENY:
+        return (dec.DENY, msg.SCHEDULE_DENY, sched.reason, False,
+                reasons + ["Not authorised to enter at this time"])
+
+    if verdict == dec.ALLOW and sched.grace:
+        return (dec.STEP_UP, msg.SCHEDULE_GRACE, sched.reason, True,
+                reasons + [f"Within the {config.SCHEDULE_GRACE_MIN}-minute grace "
+                           "band, authenticator code required"])
+
+    # Inside the window (or a biometric STEP_UP that still has its own
+    # challenge to pass -- the schedule is re-checked once it does).
+    return verdict, None, sched.reason, False, reasons
 
 
 def _apply_force(verdict: str) -> str:
@@ -328,14 +371,26 @@ def verify(req: VerifyRequest):
 
     verdict = _apply_force(verdict)
 
+    # Being live and recognised is not authorisation: the campus schedule has
+    # the last word. It can only downgrade (ALLOW -> STEP_UP -> DENY).
+    verdict, sched_code, sched_reason, totp_required, sched_reasons = (
+        _apply_schedule(verdict, name, req.sim_time))
+    code = sched_code or code
+    reasons = reasons + sched_reasons
+
     sid = state.new_session(name, live.score, match)
+    state.sessions[sid]["sim_time"] = req.sim_time
     challenge = None
-    if verdict == dec.STEP_UP:
+    if verdict == dec.STEP_UP and totp_required:
+        # Grace band: a code only, never a face challenge.
+        state.sessions[sid]["totp_required"] = True
+    elif verdict == dec.STEP_UP:
         challenge = rng.choice(config.CHALLENGES)
         state.sessions[sid]["challenge"] = challenge
 
     return _response(verdict, name, live.score, match, reasons + live.reasons,
-                     t0, sid, challenge, scores=_scores(live, match),
+                     t0, sid, challenge, totp_required=totp_required,
+                     schedule_reason=sched_reason, scores=_scores(live, match),
                      reason_code=code)
 
 
@@ -353,6 +408,10 @@ def challenge(req: ChallengeRequest):
 
     expected = session.get("challenge") or rng.choice(config.CHALLENGES)
     enrolled = session["name"]
+    # A sim_time on this request wins; otherwise reuse the one /verify saw, so
+    # the whole demo flow stays at the same simulated moment.
+    sim_time = req.sim_time or session.get("sim_time")
+    session["sim_time"] = sim_time
 
     images = face_mod.decode_frames(req.frames)
     quality = face_mod.assess_quality(images, config.MIN_FRAMES_CHALLENGE)
@@ -414,26 +473,51 @@ def challenge(req: ChallengeRequest):
         live_score = max(session["liveness"], config.LIVENESS_ALLOW + 0.05)
         session["liveness"] = live_score
         log.info("challenge '%s' passed for %s", expected["action"], enrolled)
-        return _response(_apply_force(dec.ALLOW), enrolled, live_score, match,
-                         chal_reasons + [f"Identity confirmed as {enrolled} ({match:.2f})"],
-                         t0, req.session_id, scores=scores, reason_code=msg.ALLOW)
+        # Passing the challenge settles the biometric half only -- the schedule
+        # must still authorise the entry.
+        verdict, sched_code, sched_reason, totp_required, sched_reasons = (
+            _apply_schedule(dec.ALLOW, enrolled, sim_time))
+        if totp_required:
+            session["totp_required"] = True
+        elif verdict == dec.DENY:
+            session["totp_required"] = False
+        return _response(_apply_force(verdict) if verdict != dec.DENY else verdict,
+                         enrolled, live_score, match,
+                         chal_reasons + [f"Identity confirmed as {enrolled} ({match:.2f})"]
+                         + sched_reasons,
+                         t0, req.session_id, totp_required=totp_required,
+                         schedule_reason=sched_reason, scores=scores,
+                         reason_code=sched_code or msg.ALLOW)
 
-    # Action failed -> fall back to TOTP.
+    # Action failed -> fall back to TOTP, unless the schedule rules it out
+    # anyway (no point burning a code on an entry that cannot be authorised).
+    sched = policy.evaluate(enrolled, policy.parse_sim_time(sim_time))
+    if sched.status in SCHEDULE_HARD_DENY:
+        session["totp_required"] = False
+        log.info("challenge '%s' failed for %s and schedule denies (%s)",
+                 expected["action"], enrolled, sched.status)
+        return _response(dec.DENY, enrolled, session["liveness"], match,
+                         chal_reasons + [f"Schedule: {sched.reason}"],
+                         t0, req.session_id, schedule_reason=sched.reason,
+                         scores=scores, reason_code=msg.SCHEDULE_DENY)
+
     session["totp_required"] = True
     log.info("challenge '%s' failed for %s, TOTP required", expected["action"], enrolled)
     return _response(_apply_force(dec.STEP_UP), enrolled, session["liveness"], match,
                      chal_reasons + ["Challenge not completed, enter the code from your authenticator app"],
-                     t0, req.session_id, totp_required=True, scores=scores,
+                     t0, req.session_id, totp_required=True,
+                     schedule_reason=sched.reason, scores=scores,
                      reason_code=msg.STEP_UP_TOTP)
 
 
 def _otp_response(verdict: str, name: Optional[str], reason: str,
-                  reason_code: str) -> dict:
+                  reason_code: str, schedule_reason: Optional[str] = None) -> dict:
     """/otp keeps its short shape but carries the same title/message/reason_code."""
     code = msg.code_for(verdict, reason_code)
     title, message = msg.render(code, name=name)
     return {"decision": verdict, "name": name, "title": title, "message": message,
-            "reason_code": code, "reason": reason}
+            "reason_code": code, "reason": reason,
+            "schedule_reason": schedule_reason or ZONE_LINE}
 
 
 @app.post("/otp")
@@ -463,8 +547,20 @@ def otp(req: OtpRequest):
 
     state.face.gallery.consume_totp_step(name, step)
     session["totp_required"] = False
+
+    # Last gate: a correct code still does not override the schedule. The grace
+    # band is fine here -- a code is exactly what it asked for.
+    sim_time = req.sim_time or session.get("sim_time")
+    session["sim_time"] = sim_time
+    sched = policy.evaluate(name, policy.parse_sim_time(sim_time))
+    if sched.status in SCHEDULE_HARD_DENY:
+        log.info("TOTP accepted for %s but schedule denies (%s)", name, sched.status)
+        return _otp_response(dec.DENY, name, sched.reason, msg.SCHEDULE_DENY,
+                             sched.reason)
+
     log.info("TOTP accepted for %s", name)
-    return _otp_response(dec.ALLOW, name, "Authenticator code accepted", msg.ALLOW)
+    return _otp_response(dec.ALLOW, name, "Authenticator code accepted", msg.ALLOW,
+                         sched.reason)
 
 
 # ------------------------------------------------------------- dev-only routes
