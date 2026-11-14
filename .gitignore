@@ -41,6 +41,7 @@ models/
 eval/results/*.json
 eval/results/*.csv
 eval/results/*.png
+eval/screens/
 
 # --- editors / OS ---
 .vscode/

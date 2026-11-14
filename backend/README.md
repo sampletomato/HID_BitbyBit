@@ -3,9 +3,9 @@
 FastAPI service implementing the shared API contract.
 
 **Real so far:** frame decode, quality gate, **InsightFace buffalo_l face
-recognition** (YuNet+SFace fallback), **passive anti-spoof** (MiniFASNetV2-SE),
-the decision policy, and **TOTP** step-up. Blink and device-in-frame liveness
-sub-signals are still stubbed (`STUB-STEP5`).
+recognition** (YuNet+SFace fallback), a full **liveness stack** (passive
+anti-spoof + MediaPipe blink/head-motion + YOLO device-in-frame), the decision
+policy, and **TOTP** step-up.
 
 Two run modes via `MODE` (one codebase):
 - `MODE=edge` (default) — kiosk laptop, runs the face models.
@@ -71,6 +71,37 @@ device are still stubbed. Reason strings: *"Real skin texture (0.97)"* /
 ```bash
 python tools/test_antispoof.py   # scores sample faces + measures latency
 ```
+
+## Liveness fusion (passive + blink/motion + device)
+
+Final liveness is a weighted mix of three graded signals, with two hard DENY
+flags on top. Weights and thresholds are all in `config.py`.
+
+| signal | model | contributes |
+|---|---|---|
+| passive | MiniFASNetV2-SE | `W_PASSIVE` (0.60) + hard veto below `ANTISPOOF_SPOOF_VETO` |
+| head motion | MediaPipe Face Landmarker | `W_MOTION` (0.25) — yaw/pitch range across the 10 frames |
+| blink | MediaPipe Face Landmarker | `W_BLINK` (0.15) — EAR dip (open→closed) |
+| device | YOLOv8n | **hard DENY** if a `cell phone`/`laptop`/`tv` box overlaps the face box |
+
+- **Motion**: a flat photo has ~0 out-of-plane rotation, so yaw/pitch range ≈ 0.
+  If the landmarker yields < 2 head poses, falls back to frame-difference motion.
+- **Blink**: eye-aspect-ratio per MediaPipe's 478-point mesh; needs an actual
+  open→closed swing (`EAR_BLINK_DELTA`), so a static photo never "blinks".
+- **Device**: `DEVICE_FACE_OVERLAP` — a phone/screen *showing* a face surrounds
+  the face box (ratio ≈ 1.0), which is exactly the replay-attack geometry.
+- Each signal adds a human-readable reason. Per-signal latency is logged on
+  every `/verify` and surfaced in the `parts` of the test tools.
+
+```bash
+python tools/test_liveness.py    # all signals + per-signal latency (no webcam)
+python tools/webcam_test.py      # live overlay: real_prob, box, ms  (needs a camera)
+```
+
+Blink/motion needs `mediapipe`; device needs `ultralytics` (+ CPU `torch`). If
+either is absent the server still runs — that signal degrades (motion falls back
+to frame-difference, device check is skipped) and logs a warning. Weights are
+fetched by `tools/fetch_models.py` (`face_landmarker.task`, `yolov8n.pt`).
 
 ## Endpoints
 

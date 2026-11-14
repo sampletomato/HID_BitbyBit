@@ -184,14 +184,19 @@ def verify(req: VerifyRequest):
     t0 = time.time()
     rng = random.Random()
 
+    t_decode = time.time()
     images = face_mod.decode_frames(req.frames)
     quality = face_mod.assess_quality(images, config.MIN_FRAMES_VERIFY)
+    t_quality = time.time()
     if not quality.ok:
         sid = state.new_session(None, 0.0, 0.0)
         return _response(_apply_force(dec.RECAPTURE), None, 0.0, 0.0,
                          [quality.reason], t0, sid)
 
     name, match, burst = state.face.identify(images)
+    t_identify = time.time()
+    log.info("verify stages: decode+quality=%.0fms identify=%.0fms",
+             (t_quality - t_decode) * 1000, (t_identify - t_quality) * 1000)
 
     # No usable face is a capture problem, not a spoof -- ask for another try.
     # The passive model needs a bbox, so it only runs once a face is found.

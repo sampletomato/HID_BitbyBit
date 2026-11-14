@@ -9,6 +9,7 @@ a second time. Blink and device-in-frame are still STUB-STEP5.
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
 import cv2
@@ -146,6 +147,157 @@ class PassiveAntiSpoof:
         return float(np.mean(probs)), per_frame, len(per_frame)
 
 
+# ----------------------------------------------------- blink + head motion ---
+# 6-point eye-aspect-ratio landmarks on MediaPipe's 478-point face mesh.
+_LEFT_EYE = (33, 160, 158, 133, 153, 144)
+_RIGHT_EYE = (362, 385, 387, 263, 373, 380)
+
+
+def _ear(pts: np.ndarray) -> float:
+    """Eye aspect ratio from 6 points: (|p2-p6|+|p3-p5|) / (2|p1-p4|)."""
+    a = np.linalg.norm(pts[1] - pts[5])
+    b = np.linalg.norm(pts[2] - pts[4])
+    c = np.linalg.norm(pts[0] - pts[3])
+    return float((a + b) / (2.0 * c)) if c > 1e-6 else 0.0
+
+
+def _yaw_pitch_deg(matrix: np.ndarray) -> Tuple[float, float]:
+    """Yaw, pitch (degrees) from a 4x4 facial transformation matrix."""
+    r = np.asarray(matrix)[:3, :3]
+    sy = float(np.hypot(r[0, 0], r[1, 0]))
+    pitch = np.degrees(np.arctan2(r[2, 1], r[2, 2]))
+    yaw = np.degrees(np.arctan2(-r[2, 0], sy))
+    return float(yaw), float(pitch)
+
+
+class BlinkMotion:
+    """MediaPipe Face Landmarker: EAR-based blink + yaw/pitch micro-motion."""
+
+    def __init__(self):
+        self.landmarker = None
+        self.available = False
+
+    def load(self):
+        if not config.FACE_LANDMARKER_MODEL.exists():
+            log.error("face_landmarker.task missing at %s -- run tools/fetch_models.py; "
+                      "blink/motion will be neutral", config.FACE_LANDMARKER_MODEL)
+            return
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+        opts = vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(
+                model_asset_path=str(config.FACE_LANDMARKER_MODEL)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+            output_facial_transformation_matrixes=True,
+        )
+        self.landmarker = vision.FaceLandmarker.create_from_options(opts)
+        # Warm up: the first detect() builds the TFLite/XNNPACK graph (~0.5 s),
+        # which would otherwise land on the first real request.
+        import mediapipe as mp
+        self.landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
+                                        data=np.zeros((480, 640, 3), dtype=np.uint8)))
+        self.available = True
+        log.info("blink/motion ready (MediaPipe Face Landmarker)")
+
+    def analyze(self, images: List[np.ndarray]) -> dict:
+        """Returns blink/motion evidence over the burst.
+
+        {blink_detected, blink_score, motion_score, min_ear, yaw_range,
+         pitch_range, frames_with_face}. Values are None-free; when the model is
+         unavailable the caller falls back to a frame-difference motion proxy.
+        """
+        import mediapipe as mp
+        ears, yaws, pitches = [], [], []
+        for img in images:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = self.landmarker.detect(mp_img)
+            if not res.face_landmarks:
+                continue
+            h, w = img.shape[:2]
+            lms = res.face_landmarks[0]
+            coords = np.array([[lms[i].x * w, lms[i].y * h] for i in
+                               (*_LEFT_EYE, *_RIGHT_EYE)], dtype=np.float32)
+            left_ear = _ear(coords[:6])
+            right_ear = _ear(coords[6:])
+            ears.append((left_ear + right_ear) / 2.0)
+            if res.facial_transformation_matrixes:
+                yaw, pitch = _yaw_pitch_deg(res.facial_transformation_matrixes[0])
+                yaws.append(yaw)
+                pitches.append(pitch)
+
+        if not ears:
+            return {"blink_detected": False, "blink_score": 0.0, "motion_score": None,
+                    "min_ear": None, "yaw_range": 0.0, "pitch_range": 0.0,
+                    "frames_with_face": 0}
+
+        min_ear, max_ear = min(ears), max(ears)
+        blink_detected = (min_ear < config.EAR_BLINK_THRESHOLD
+                          and (max_ear - min_ear) >= config.EAR_BLINK_DELTA)
+        blink_score = 1.0 if blink_detected else float(np.clip(
+            (max_ear - min_ear) / config.EAR_BLINK_DELTA, 0.0, 0.8))
+
+        yaw_range = (max(yaws) - min(yaws)) if len(yaws) >= 2 else 0.0
+        pitch_range = (max(pitches) - min(pitches)) if len(pitches) >= 2 else 0.0
+        motion_score = None
+        if len(yaws) >= 2:
+            motion_score = float(np.clip((yaw_range + pitch_range)
+                                         / config.MOTION_YAWPITCH_FULL_DEG, 0.0, 1.0))
+        return {"blink_detected": blink_detected, "blink_score": blink_score,
+                "motion_score": motion_score, "min_ear": round(min_ear, 3),
+                "yaw_range": round(yaw_range, 2), "pitch_range": round(pitch_range, 2),
+                "frames_with_face": len(ears)}
+
+
+class DeviceDetector:
+    """YOLO (ultralytics): phone / laptop / tv overlapping the face box."""
+
+    def __init__(self):
+        self.model = None
+        self.available = False
+
+    def load(self):
+        if not config.YOLO_MODEL.exists():
+            log.error("YOLO weights missing at %s -- run tools/fetch_models.py; "
+                      "device check disabled", config.YOLO_MODEL)
+            return
+        from ultralytics import YOLO
+        self.model = YOLO(str(config.YOLO_MODEL))
+        # Warm up so the first real request is not penalised by lazy init.
+        self.model.predict(np.zeros((480, 640, 3), dtype=np.uint8),
+                           imgsz=config.YOLO_IMGSZ, conf=config.YOLO_CONF,
+                           verbose=False, device="cpu")
+        self.available = True
+        log.info("device detector ready (YOLO %s)", config.YOLO_MODEL.name)
+
+    @staticmethod
+    def _overlap_frac(dev_xyxy, face_xywh) -> float:
+        """Intersection area / face area."""
+        dx1, dy1, dx2, dy2 = dev_xyxy
+        fx, fy, fw, fh = face_xywh
+        fx2, fy2 = fx + fw, fy + fh
+        ix1, iy1 = max(dx1, fx), max(dy1, fy)
+        ix2, iy2 = min(dx2, fx2), min(dy2, fy2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        face_area = max(1.0, fw * fh)
+        return (iw * ih) / face_area
+
+    def analyze(self, images: List[np.ndarray],
+                face_xywh: Tuple[int, int, int, int]) -> Tuple[bool, Optional[str]]:
+        for img in images[:config.YOLO_FRAMES]:
+            res = self.model.predict(img, imgsz=config.YOLO_IMGSZ, conf=config.YOLO_CONF,
+                                     verbose=False, device="cpu")[0]
+            names = res.names
+            for box in res.boxes:
+                label = names[int(box.cls)]
+                if label not in config.YOLO_DEVICE_CLASSES:
+                    continue
+                if self._overlap_frac(box.xyxy[0].tolist(), face_xywh) >= config.DEVICE_FACE_OVERLAP:
+                    return True, label
+        return False, None
+
+
 class LivenessResult:
     def __init__(self, score: float, reasons: List[str], parts: dict,
                  device_seen: bool, spoof_detected: bool = False):
@@ -161,83 +313,104 @@ class LivenessEngine:
 
     def __init__(self):
         self.passive = PassiveAntiSpoof()
+        self.blinkmotion = BlinkMotion()
+        self.device = DeviceDetector()
 
     def load(self):
-        self.passive.load()
-        log.info("LivenessEngine ready (passive=%s)",
-                 "real" if self.passive.available else "unavailable")
+        for name, engine in (("passive", self.passive), ("blink/motion", self.blinkmotion),
+                             ("device", self.device)):
+            try:
+                engine.load()
+            except Exception as exc:
+                log.warning("%s signal failed to load: %s", name, exc)
+        log.info("LivenessEngine ready (passive=%s blink/motion=%s device=%s)",
+                 self.passive.available, self.blinkmotion.available, self.device.available)
 
-    # -- individual signals ----------------------------------------------------
-
-    def _motion(self, images: List[np.ndarray]) -> float:
-        """Frame-to-frame change. A printed photo held still barely moves."""
+    def _motion_fallback(self, images: List[np.ndarray]) -> float:
+        """Frame-difference motion, used only when the landmarker is unavailable."""
         if len(images) < 2:
             return 0.5
-        diffs = []
-        prev = images[0].mean(axis=2)
+        diffs, prev = [], images[0].mean(axis=2)
         for img in images[1:]:
             cur = img.mean(axis=2)
-            if cur.shape != prev.shape:
-                prev = cur
-                continue
-            diffs.append(float(np.abs(cur - prev).mean()))
+            if cur.shape == prev.shape:
+                diffs.append(float(np.abs(cur - prev).mean()))
             prev = cur
-        if not diffs:
-            return 0.5
-        # ~1.5 grey levels of mean change across a burst is a comfortably live face.
-        return float(min(1.0, np.mean(diffs) / 1.5))
-
-    def _blink(self, rng: random.Random) -> Tuple[float, bool]:
-        """STUB-STEP5: MediaPipe eye-aspect-ratio dip detection."""
-        detected = rng.random() < 0.8
-        return (rng.uniform(0.75, 0.95) if detected else rng.uniform(0.2, 0.45)), detected
-
-    def _device(self, rng: random.Random) -> Tuple[float, bool]:
-        """STUB-STEP5: YOLOv8n looking for phone / laptop / tv bezels."""
-        seen = rng.random() < 0.08
-        return (0.0 if seen else 1.0), seen
+        return float(min(1.0, np.mean(diffs) / 1.5)) if diffs else 0.5
 
     # -- fusion ----------------------------------------------------------------
 
     def score(self, images: List[np.ndarray], detections: List[Detection],
               rng: random.Random) -> LivenessResult:
-        t0 = time.time()
-        passive_avg, passive_frames, n_passive = self.passive.score_detections(detections)
-        passive_ms = (time.time() - t0) * 1000
+        timings = {}
+        face_box = detections[0][1] if detections else None
+        bm_default = {"blink_detected": False, "blink_score": 0.0, "motion_score": None,
+                      "min_ear": None, "yaw_range": 0.0, "pitch_range": 0.0,
+                      "frames_with_face": 0}
 
-        # When the model is unavailable, don't fail open: fall back to a neutral
-        # 0.5 and flag it loudly in the reasons.
+        # Blink/motion (MediaPipe) and device (YOLO) are the two slow, independent
+        # checks -- run them concurrently. Both release the GIL during inference,
+        # so this roughly halves the liveness latency.
+        def run_blinkmotion():
+            t = time.time()
+            out = self.blinkmotion.analyze(images) if self.blinkmotion.available else bm_default
+            return out, round((time.time() - t) * 1000, 1)
+
+        def run_device():
+            t = time.time()
+            seen, label = (self.device.analyze(images, face_box)
+                           if self.device.available and face_box is not None else (False, None))
+            return (seen, label), round((time.time() - t) * 1000, 1)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_bm = pool.submit(run_blinkmotion)
+            f_dev = pool.submit(run_device)
+            # Passive is cheap; run it on this thread while the others work.
+            t = time.time()
+            passive_avg, passive_frames, _ = self.passive.score_detections(detections)
+            timings["passive_ms"] = round((time.time() - t) * 1000, 1)
+            bm, timings["blinkmotion_ms"] = f_bm.result()
+            (device_seen, device_label), timings["device_ms"] = f_dev.result()
+
+        # --- graded signals -------------------------------------------------
         passive = passive_avg if passive_avg is not None else 0.5
-        motion = self._motion(images)
-        blink, blink_seen = self._blink(rng)
-        device, device_seen = self._device(rng)
+        blink = bm["blink_score"]
+        motion = bm["motion_score"]
+        if motion is None:                       # landmarker gave < 2 head poses
+            motion = self._motion_fallback(images)
 
         fused = (config.W_PASSIVE * passive + config.W_MOTION * motion
-                 + config.W_BLINK * blink + config.W_DEVICE * device)
+                 + config.W_BLINK * blink)
         fused = round(float(np.clip(fused, 0.0, 1.0)), 2)
 
-        # A confident spoof from the passive model vetoes to DENY on its own.
+        # --- hard flags -----------------------------------------------------
+        # A detected device, or a confident passive spoof, each force DENY.
         spoof_detected = passive_avg is not None and passive_avg < config.ANTISPOOF_SPOOF_VETO
 
+        # --- reasons --------------------------------------------------------
         reasons = []
+        if device_seen:
+            reasons.append(f"Phone/screen detected around face ({device_label})")
         if passive_avg is None:
             reasons.append("Passive model unavailable, liveness reduced")
         elif passive >= config.ANTISPOOF_REAL_MIN:
             reasons.append(f"Real skin texture ({passive:.2f})")
         else:
             reasons.append(f"Print/screen texture detected ({passive:.2f})")
-        reasons.append("Natural micro-motion detected" if motion >= 0.4
-                       else "Frames look static, possible printed photo")
-        reasons.append("Blink detected" if blink_seen else "No blink detected")
-        reasons.append("Screen or phone detected in frame" if device_seen
-                       else "No phone or screen in frame")
+        reasons.append(f"Blink detected (EAR {bm['min_ear']})" if bm["blink_detected"]
+                       else "No blink detected")
+        reasons.append(f"Head micro-motion present ({bm['yaw_range']:.1f}deg yaw)"
+                       if motion >= 0.4 else "Frames look static, possible printed photo")
 
-        log.info("liveness fused=%.2f passive=%.3f(n=%d,%.0fms) motion=%.2f",
-                 fused, passive, n_passive, passive_ms, motion)
+        log.info("liveness fused=%.2f passive=%.3f motion=%.2f blink=%.2f "
+                 "device=%s | %s", fused, passive, motion, blink,
+                 device_label or "none", timings)
 
         parts = {"passive": round(passive, 3), "passive_frames": passive_frames,
-                 "passive_ms": round(passive_ms, 1), "motion": round(motion, 2),
-                 "blink": round(blink, 2), "device": round(device, 2)}
+                 "motion": round(motion, 2), "blink": round(blink, 2),
+                 "blink_detected": bm["blink_detected"], "device": device_label,
+                 "yaw_range": bm["yaw_range"], "pitch_range": bm["pitch_range"],
+                 **timings}
         return LivenessResult(fused, reasons, parts, device_seen, spoof_detected)
 
     # -- active challenge ------------------------------------------------------

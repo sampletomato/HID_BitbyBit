@@ -20,11 +20,17 @@ import config  # noqa: E402
 
 ZOO = "https://github.com/opencv/opencv_zoo/raw/main/models"
 FACENOX = "https://raw.githubusercontent.com/facenox/face-antispoof-onnx/main/models"
+MP = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1"
+YOLO = "https://github.com/ultralytics/assets/releases/download/v8.3.0"
 MODELS = [
     # Passive anti-spoof: INT8 primary, fp32 fallback. The published top-level
     # quantized model is the 98.20 variant; the matching fp32 lives in best/98.20/.
     (f"{FACENOX}/best_model_quantized.onnx", config.ANTISPOOF_MODEL),
     (f"{FACENOX}/best/98.20/best_model.onnx", config.ANTISPOOF_MODEL_FP32),
+    # Blink + head-motion (MediaPipe Face Landmarker bundle).
+    (f"{MP}/face_landmarker.task", config.FACE_LANDMARKER_MODEL),
+    # Device-in-frame detector (YOLOv8n, COCO; has 'cell phone','laptop','tv').
+    (f"{YOLO}/yolov8n.pt", config.YOLO_MODEL),
     (f"{ZOO}/face_detection_yunet/face_detection_yunet_2023mar.onnx",
      config.YUNET_MODEL),
     (f"{ZOO}/face_recognition_sface/face_recognition_sface_2021dec.onnx",

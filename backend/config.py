@@ -69,12 +69,31 @@ ANTISPOOF_REAL_MIN = 0.5         # real-probability above which a frame reads "l
 # STEP_UP for an obvious photo/screen attack. Genuine faces score >> this.
 ANTISPOOF_SPOOF_VETO = 0.30
 
+# --------------------------------------------------- blink + motion (MediaPipe)
+# Face Landmarker (Tasks API) run on every verify frame. EAR = eye aspect ratio.
+FACE_LANDMARKER_MODEL = MODEL_DIR / "face_landmarker.task"
+EAR_BLINK_THRESHOLD = 0.21    # per-eye EAR below this = eye closed
+EAR_BLINK_DELTA = 0.06        # open->closed swing needed to count as a real blink
+# Combined yaw+pitch range (degrees) across the burst that maps to motion = 1.0.
+# A flat photo held still has ~0 out-of-plane rotation, so it scores near 0.
+MOTION_YAWPITCH_FULL_DEG = 6.0
+
+# ----------------------------------------------------- device detection (YOLO)
+YOLO_MODEL = MODEL_DIR / "yolov8n.pt"
+YOLO_CONF = 0.35
+YOLO_IMGSZ = 320             # 320 is ~3x faster than 640 on CPU; phones/screens are large
+YOLO_FRAMES = 2              # run on 2 frames of the burst (CPU cost)
+YOLO_DEVICE_CLASSES = ("cell phone", "laptop", "tv")
+# A device box counts as a spoof when it covers at least this fraction of the
+# face box (a phone/screen showing a face surrounds it -> ratio near 1.0).
+DEVICE_FACE_OVERLAP = 0.20
+
 # ------------------------------------------------------------- fusion weights
-# Used by liveness.py. Must sum to 1.0.
-W_PASSIVE = 0.50   # MiniFASNetV2-SE passive anti-spoof (real)
-W_MOTION = 0.25    # frame-to-frame micro-motion / texture consistency (real)
-W_BLINK = 0.15     # MediaPipe eye-aspect-ratio blink evidence (STUB-STEP5)
-W_DEVICE = 0.10    # YOLO phone / laptop / tv penalty (STUB-STEP5)
+# Weighted mix of the three graded liveness signals. Must sum to 1.0. The device
+# check is NOT in this mix -- a detected phone/screen is a hard DENY on its own.
+W_PASSIVE = 0.60   # MiniFASNetV2-SE passive anti-spoof
+W_MOTION = 0.25    # head yaw/pitch micro-motion across the burst
+W_BLINK = 0.15     # eye-aspect-ratio blink evidence
 
 # ---------------------------------------------------------------- quality gate
 MIN_FRAMES_ENROLL = 3

@@ -25,10 +25,16 @@ qrcode[pil]>=7.4,<9
 # That path needs only opencv + onnxruntime and ~37 MB of models.
 insightface==0.7.3
 
-# ---------------------------------------------------------------------------
-# Step 5 (liveness models). Person 2: pre-install so we are not waiting later.
-# ---------------------------------------------------------------------------
-# mediapipe>=0.10.14,<0.11
-# ultralytics>=8.3,<9
-# torch --index-url https://download.pytorch.org/whl/cpu
-# torchvision --index-url https://download.pytorch.org/whl/cpu
+# Liveness: blink/head-motion (MediaPipe) + device detection (YOLO/ultralytics).
+# Install torch CPU-only FIRST so ultralytics does not pull the CUDA build:
+#   pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu torch torchvision
+# Then, to keep opencv-python-headless as the single cv2 (mediapipe/ultralytics
+# otherwise pull full opencv and, on headless EC2, need libgl1):
+#   pip install --no-deps mediapipe==0.10.35
+#   pip install absl-py sounddevice
+#   pip install --no-deps ultralytics
+#   pip install psutil py-cpuinfo pandas ultralytics-thop
+# (mediapipe and ultralytics are intentionally NOT pinned as hard deps here so a
+#  plain `pip install -r requirements.txt` stays light and headless-clean.)
+mediapipe==0.10.35
+ultralytics>=8.3,<9
