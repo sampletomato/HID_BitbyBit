@@ -191,18 +191,20 @@ def verify(req: VerifyRequest):
         return _response(_apply_force(dec.RECAPTURE), None, 0.0, 0.0,
                          [quality.reason], t0, sid)
 
-    live = state.liveness.score(images, rng)
     name, match, burst = state.face.identify(images)
 
     # No usable face is a capture problem, not a spoof -- ask for another try.
+    # The passive model needs a bbox, so it only runs once a face is found.
     if burst.query is None:
-        sid = state.new_session(None, live.score, 0.0)
-        return _response(_apply_force(dec.RECAPTURE), None, live.score, 0.0,
+        sid = state.new_session(None, 0.0, 0.0)
+        return _response(_apply_force(dec.RECAPTURE), None, 0.0, 0.0,
                          [burst.note], t0, sid)
+
+    live = state.liveness.score(images, burst.detections, rng)
 
     verdict, reasons = dec.decide(live.score, match, name,
                                   state.face.match_allow, state.face.match_deny,
-                                  live.device_seen)
+                                  live.device_seen, live.spoof_detected)
     verdict = _apply_force(verdict)
 
     sid = state.new_session(name, live.score, match)

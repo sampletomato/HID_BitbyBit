@@ -3,8 +3,9 @@
 FastAPI service implementing the shared API contract.
 
 **Real so far:** frame decode, quality gate, **InsightFace buffalo_l face
-recognition** (YuNet+SFace fallback), the decision policy, and **TOTP** step-up.
-Liveness sub-scores are still stubbed (`STUB-STEP3`) pending step 5.
+recognition** (YuNet+SFace fallback), **passive anti-spoof** (MiniFASNetV2-SE),
+the decision policy, and **TOTP** step-up. Blink and device-in-frame liveness
+sub-signals are still stubbed (`STUB-STEP5`).
 
 Two run modes via `MODE` (one codebase):
 - `MODE=edge` (default) — kiosk laptop, runs the face models.
@@ -50,6 +51,26 @@ export FACE_BACKEND=opencv
 Match thresholds differ per backend (the two produce non-comparable cosine
 scores) — both sets live in `config.MATCH_THRESHOLDS`. Re-enroll everyone if you
 switch backends; the server logs a warning for enrollments made under the other.
+
+## Passive anti-spoof
+
+MiniFASNetV2-SE (INT8) from
+[facenox/face-antispoof-onnx](https://github.com/facenox/face-antispoof-onnx)
+(Apache-2.0). **Required** — `tools/fetch_models.py` downloads it (~0.6 MB).
+Crop + preprocess are copied verbatim from that repo (`liveness.py`): RGB,
+bbox expanded 1.5×, letterbox to 128×128, `/255`, CHW. Output logits
+`[real, spoof]` → real-prob = sigmoid(real − spoof).
+
+It runs on the 3 sharpest **already-detected** frames (reusing the InsightFace
+bbox, no second detector pass), averaging the real-probability — ~20 ms added.
+A real-prob below `config.ANTISPOOF_SPOOF_VETO` (0.30) hard-vetoes to **DENY**
+on its own, so an obvious print/screen attack is rejected even while blink and
+device are still stubbed. Reason strings: *"Real skin texture (0.97)"* /
+*"Print/screen texture detected (0.08)"*.
+
+```bash
+python tools/test_antispoof.py   # scores sample faces + measures latency
+```
 
 ## Endpoints
 

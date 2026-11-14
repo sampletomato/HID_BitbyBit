@@ -159,22 +159,12 @@ class InsightFaceBackend:
         self.rec = None
         self._align = None
 
-    @staticmethod
-    def _session_options(ort):
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = config.ORT_THREADS
-        so.inter_op_num_threads = 1
-        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        return so
-
     def load(self):
-        import onnxruntime as ort
+        import ort_utils
         from insightface.model_zoo.arcface_onnx import ArcFaceONNX
         from insightface.model_zoo.retinaface import RetinaFace
         from insightface.utils import face_align, storage
 
-        ort.set_default_logger_severity(3)   # silence per-run shape warnings
         self._align = face_align
 
         # Downloads buffalo_l into config.MODEL_DIR on first run.
@@ -186,17 +176,12 @@ class InsightFaceBackend:
             if not p.exists():
                 raise FileNotFoundError(f"{p} missing from the buffalo_l pack")
 
-        so = self._session_options(ort)
-        providers = ["CPUExecutionProvider"]
-
         self.det = RetinaFace(model_file=str(det_path),
-                              session=ort.InferenceSession(str(det_path), so,
-                                                           providers=providers))
+                              session=ort_utils.make_session(det_path))
         self.det.prepare(ctx_id=-1, input_size=(config.DET_SIZE, config.DET_SIZE))
 
         self.rec = ArcFaceONNX(model_file=str(rec_path),
-                               session=ort.InferenceSession(str(rec_path), so,
-                                                            providers=providers))
+                               session=ort_utils.make_session(rec_path))
         self.rec.prepare(ctx_id=-1)
 
     def analyze(self, img: np.ndarray) -> Optional[DetectedFace]:
@@ -254,14 +239,21 @@ class OpenCVBackend:
 
 
 class BurstResult:
-    """What we could extract from one burst of frames."""
+    """What we could extract from one burst of frames.
+
+    `detections` carries (frame_bgr, bbox_xywh) for each frame a face was found
+    in, so downstream consumers (passive anti-spoof) can reuse the detection
+    instead of running the detector a second time.
+    """
 
     def __init__(self, query: Optional[np.ndarray], faces_found: int,
-                 note: Optional[str], embeddings: Optional[List[np.ndarray]] = None):
+                 note: Optional[str], embeddings: Optional[List[np.ndarray]] = None,
+                 detections: Optional[List[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = None):
         self.query = query            # averaged, normalised query embedding
         self.faces_found = faces_found
         self.note = note
         self.embeddings = embeddings or []
+        self.detections = detections or []
 
 
 # ---------------------------------------------------------------------- gallery
@@ -385,7 +377,7 @@ class FaceEngine:
     def embed_burst(self, images: List[np.ndarray], max_frames: int = None) -> BurstResult:
         """Detect + embed the sharpest frames, averaged into one query vector."""
         chosen = pick_sharpest(images, max_frames or config.EMBED_FRAMES)
-        embeddings, too_small = [], 0
+        embeddings, detections, too_small = [], [], 0
         for img in chosen:
             face = self.backend.analyze(img)
             if face is None:
@@ -394,6 +386,7 @@ class FaceEngine:
                 too_small += 1
                 continue
             embeddings.append(face.embedding)
+            detections.append((img, face.bbox))
 
         if not embeddings:
             note = ("Face too far from the camera, please step closer"
@@ -401,7 +394,7 @@ class FaceEngine:
             return BurstResult(None, 0, note)
 
         query = l2norm(np.mean(np.stack(embeddings), axis=0))
-        return BurstResult(query, len(embeddings), None, embeddings)
+        return BurstResult(query, len(embeddings), None, embeddings, detections)
 
     # -- enrollment ------------------------------------------------------------
 

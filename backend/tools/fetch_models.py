@@ -1,7 +1,11 @@
-"""Download the OpenCV YuNet + SFace ONNX models (the fallback face backend).
+"""Download the ONNX model weights (all gitignored).
 
-Only needed when InsightFace is unavailable. InsightFace fetches buffalo_l
-itself on first load, into backend/models/.
+  * passive anti-spoof -- MiniFASNetV2-SE from facenox/face-antispoof-onnx
+    (Apache-2.0). Required for real liveness.
+  * YuNet + SFace -- the OpenCV fallback face backend, only needed when
+    InsightFace is unavailable.
+
+InsightFace fetches buffalo_l itself on first load, into backend/models/.
 
     python tools/fetch_models.py
 """
@@ -15,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
 
 ZOO = "https://github.com/opencv/opencv_zoo/raw/main/models"
+FACENOX = "https://raw.githubusercontent.com/facenox/face-antispoof-onnx/main/models"
 MODELS = [
+    (f"{FACENOX}/best_model_quantized.onnx", config.ANTISPOOF_MODEL),
     (f"{ZOO}/face_detection_yunet/face_detection_yunet_2023mar.onnx",
      config.YUNET_MODEL),
     (f"{ZOO}/face_recognition_sface/face_recognition_sface_2021dec.onnx",
@@ -44,4 +50,4 @@ if __name__ == "__main__":
     for url, dest in MODELS:
         fetch(url, dest)
     print(f"\nmodels in {config.MODEL_DIR}")
-    print("force this backend with: FACE_BACKEND=opencv")
+    print("anti-spoof is required; YuNet+SFace only for FACE_BACKEND=opencv")

@@ -53,12 +53,27 @@ MATCH_THRESHOLDS = {
     "stub": {"allow": 0.45, "deny": 0.25},
 }
 
+# --------------------------------------------------- passive anti-spoof model
+# MiniFASNetV2-SE (INT8) from github.com/facenox/face-antispoof-onnx (Apache-2.0).
+# 128x128 RGB input, output logits [real, spoof]. Crop + preprocess copied
+# verbatim from that repo (see liveness.py) -- do not "improve" them, the model
+# was trained against that exact pipeline.
+ANTISPOOF_MODEL = MODEL_DIR / "best_model_quantized.onnx"
+ANTISPOOF_INPUT = 128
+ANTISPOOF_BBOX_EXPANSION = 1.5   # facenox default; the model expects this context
+ANTISPOOF_FRAMES = 3             # run on the 3 sharpest detected frames of the burst
+ANTISPOOF_REAL_MIN = 0.5         # real-probability above which a frame reads "live"
+# A confident spoof hard-vetoes to DENY on its own. Without this, while blink
+# and device are still stubbed optimistic, fusion alone would only reach
+# STEP_UP for an obvious photo/screen attack. Genuine faces score >> this.
+ANTISPOOF_SPOOF_VETO = 0.30
+
 # ------------------------------------------------------------- fusion weights
-# Used by liveness.py once the real models land (step 5). Must sum to 1.0.
-W_PASSIVE = 0.50   # MiniFASNet passive anti-spoof
-W_MOTION = 0.25    # frame-to-frame micro-motion / texture consistency
-W_BLINK = 0.15     # MediaPipe eye-aspect-ratio blink evidence
-W_DEVICE = 0.10    # YOLO phone / laptop / tv penalty
+# Used by liveness.py. Must sum to 1.0.
+W_PASSIVE = 0.50   # MiniFASNetV2-SE passive anti-spoof (real)
+W_MOTION = 0.25    # frame-to-frame micro-motion / texture consistency (real)
+W_BLINK = 0.15     # MediaPipe eye-aspect-ratio blink evidence (STUB-STEP5)
+W_DEVICE = 0.10    # YOLO phone / laptop / tv penalty (STUB-STEP5)
 
 # ---------------------------------------------------------------- quality gate
 MIN_FRAMES_ENROLL = 3

@@ -20,7 +20,7 @@ ALL = (ALLOW, STEP_UP, DENY, RECAPTURE)
 
 def decide(liveness: float, match: float, name: Optional[str],
            match_allow: float, match_deny: float,
-           device_seen: bool = False) -> Tuple[str, List[str]]:
+           device_seen: bool = False, spoof_detected: bool = False) -> Tuple[str, List[str]]:
     """Map scores to a biometric verdict plus the reasons the kiosk shows.
 
     Match thresholds are passed in because they depend on which recognition
@@ -34,6 +34,9 @@ def decide(liveness: float, match: float, name: Optional[str],
 
     if device_seen:
         return DENY, ["Replay attack suspected: a screen or phone was in frame"]
+
+    if spoof_detected:
+        return DENY, ["Presentation attack detected: print/screen texture"]
 
     if liveness < config.LIVENESS_DENY:
         return DENY, [f"Presentation attack detected (liveness {liveness:.2f})"]
