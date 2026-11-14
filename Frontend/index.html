@@ -1,1 +1,108 @@
-front end UI
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071326">
+  <title>HID Secure Access</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="HID Secure Access home"><span class="brand-mark">H</span><span>HID <b>Secure Access</b></span></a>
+      <div class="zone"><span class="pulse-dot"></span> CAMPUS · NORTH ENTRY</div>
+      <div id="onlineBadge" class="online-badge"><span></span><b>CONNECTING</b></div>
+    </header>
+    <div id="offlineBanner" class="offline-banner" hidden>⚠ Backend unavailable — safe mode. Access decisions are paused until the connection returns.</div>
+
+    <main class="kiosk-grid">
+      <section class="camera-panel" aria-label="Live camera">
+        <div class="camera-frame" id="cameraFrame">
+          <video id="camera" autoplay muted playsinline></video>
+          <div class="camera-shade"></div>
+          <div class="face-guide" id="faceGuide"><span class="guide-corner tl"></span><span class="guide-corner tr"></span><span class="guide-corner bl"></span><span class="guide-corner br"></span><div class="guide-scan"></div></div>
+          <div id="cameraMessage" class="camera-message"><span class="camera-icon">◉</span><span>Camera preview will appear here</span></div>
+          <div class="camera-label"><span class="live-dot"></span> LIVE CAMERA <span class="camera-resolution">640 × 480</span></div>
+        </div>
+        <div class="camera-hint"><span class="hint-icon">◎</span><span id="cameraHint">Position your face inside the guide</span></div>
+      </section>
+
+      <section class="right-panel" aria-live="polite">
+        <div class="section-kicker"><span class="kicker-line"></span><span id="stepLabel">SECURE ENTRY</span></div>
+        <div id="viewHome" class="view active">
+          <h1>Welcome to<br><span>campus.</span></h1>
+          <p class="lede">Verify your identity for secure entry.</p>
+          <button class="btn btn-primary btn-hero" id="verifyBtn"><span class="btn-icon">◉</span><span>Verify</span><span class="arrow">→</span></button>
+          <button class="btn btn-secondary" id="registerBtn"><span class="plus">＋</span> Register new user</button>
+          <div class="privacy-note"><span>▣</span> Your biometric data is encrypted and never leaves this system.</div>
+        </div>
+        <div id="viewBusy" class="view">
+          <div class="busy-icon"><span class="spinner"></span></div>
+          <h1 id="busyTitle">Checking<br><span>liveness.</span></h1>
+          <p class="lede" id="busyText">Keep looking at the camera.</p>
+          <div class="progress-track"><div id="progressBar"></div></div>
+          <div class="timer-row"><span>ELAPSED</span><strong id="stopwatch">0.00<span>s</span></strong></div>
+        </div>
+        <div id="viewRegister" class="view">
+          <button class="back-link" data-home>← Back</button>
+          <h1>New <span>enrollment.</span></h1>
+          <p class="lede">Register your face for campus access.</p>
+          <label class="field-label" for="nameInput">FULL NAME</label>
+          <input id="nameInput" class="text-input" maxlength="64" autocomplete="name" placeholder="e.g. Jordan Lee">
+          <button class="btn btn-primary" id="enrollBtn">Continue <span class="arrow">→</span></button>
+          <p class="inline-error" id="enrollError" hidden></p>
+        </div>
+        <div id="viewEnrollment" class="view">
+          <div class="success-mark">✓</div>
+          <h1>You're <span>enrolled.</span></h1>
+          <p class="lede">Scan this QR code with Google Authenticator.</p>
+          <div class="qr-wrap"><img id="qrImage" alt="Authenticator setup QR code"></div>
+          <div class="enrolled-name" id="enrolledName"></div>
+          <button class="btn btn-primary" data-home>Done <span class="arrow">→</span></button>
+        </div>
+        <div id="viewResult" class="view">
+          <div id="resultIcon" class="result-icon">✓</div>
+          <h1 id="resultTitle">Access granted</h1>
+          <div id="resultName" class="result-name"></div>
+          <div class="metric-grid">
+            <div class="metric"><span>LIVENESS</span><strong id="liveMetric">—</strong></div>
+            <div class="metric"><span>FACE MATCH</span><strong id="matchMetric">—</strong></div>
+            <div class="metric"><span>DECISION TIME</span><strong id="timeMetric">—</strong></div>
+          </div>
+          <div id="scheduleReason" class="schedule-reason" hidden></div>
+          <div id="reasonChips" class="reason-chips"></div>
+          <div class="signals" id="signals">
+            <div class="signals-title">SIGNAL BREAKDOWN <span id="latencySummary"></span></div>
+            <div id="signalRows"></div>
+          </div>
+          <button class="btn btn-primary result-home" data-home>Return home <span class="arrow">→</span></button>
+        </div>
+        <div id="viewChallenge" class="view">
+          <div class="challenge-symbol">↻</div>
+          <h1 id="challengeText" class="challenge-text">Please blink twice</h1>
+          <p class="lede">Follow the instruction to continue.</p>
+          <div id="countdown" class="countdown" hidden>3</div>
+          <button class="btn btn-primary" id="challengeBtn">I'm ready <span class="arrow">→</span></button>
+        </div>
+        <div id="viewOtp" class="view">
+          <div class="challenge-symbol">⌑</div>
+          <h1>Authenticator<br><span>check.</span></h1>
+          <p class="lede">Enter the 6-digit code from your authenticator app.</p>
+          <input id="otpInput" class="text-input otp-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000">
+          <button class="btn btn-primary" id="otpBtn">Verify code <span class="arrow">→</span></button>
+          <div class="demo-phone"><div class="demo-phone-head"><span>DEMO PHONE</span><button id="demoCodeBtn">Show code ↗</button></div><div class="demo-code" id="demoCode">······</div><div class="demo-caption">Google Authenticator · HID Kiosk</div></div>
+          <p class="inline-error" id="otpError" hidden></p>
+        </div>
+        <div id="viewMessage" class="view">
+          <div class="result-icon result-neutral">!</div><h1 id="messageTitle">Unable to continue</h1><p id="messageText" class="lede"></p><button class="btn btn-primary" data-home>Return home</button>
+        </div>
+      </section>
+    </main>
+    <footer class="bottom-strip"><div class="log-heading"><span class="log-dot"></span> RECENT ACTIVITY</div><div id="attemptLog" class="attempt-log"><span class="empty-log">No recent attempts</span></div><div class="footer-lock">⌑ ENCRYPTED SESSION</div></footer>
+  </div>
+  <div class="debug-panel" id="debugPanel" hidden><div class="debug-head">DEBUG RESPONSE <button id="closeDebug">×</button></div><pre id="debugJson">No response yet.</pre></div>
+  <div class="demo-menu" id="demoMenu" hidden><div class="demo-menu-title">DEMO CONTROLS <span>D to dismiss</span></div><div class="force-buttons"><button data-force="ALLOW">ALLOW</button><button data-force="STEP_UP">STEP UP</button><button data-force="DENY">DENY</button><button data-force="RECAPTURE">RECAPTURE</button><button data-force="off">Clear override</button></div><div class="demo-force-status" id="forceStatus">Decision override: off</div></div>
+  <script src="app.js"></script>
+</body>
+</html>
