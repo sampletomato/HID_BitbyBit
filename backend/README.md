@@ -63,11 +63,20 @@ bbox expanded 1.5×, letterbox to 128×128, `/255`, CHW. Output logits
 `[real, spoof]` → real-prob = sigmoid(real − spoof).
 
 It runs on the 3 sharpest **already-detected** frames (reusing the InsightFace
-bbox, no second detector pass), averaging the real-probability — ~20 ms added.
-A real-prob below `config.ANTISPOOF_SPOOF_VETO` (0.30) hard-vetoes to **DENY**
-on its own, so an obvious print/screen attack is rejected even while blink and
-device are still stubbed. Reason strings: *"Real skin texture (0.97)"* /
+bbox, no second detector pass), averaging the real-probability — ~25 ms added.
+Reason strings: *"Real skin texture (0.97)"* /
 *"Print/screen texture detected (0.08)"*.
+
+**The veto is deliberately loose** (recalibrated after it rejected real faces
+in ordinary indoor light at 0.30). It fires only on a *confident* spoof:
+
+- the burst average real-prob is below `ANTISPOOF_HARD_DENY` (**0.15**), **or**
+- any single frame is below `ANTISPOOF_FRAME_PANIC` (**0.05**) — so one clearly
+  spoofed frame is not averaged away by two good ones.
+
+Anything between that and `LIVENESS_ALLOW` is **not** denied: it goes to the
+random active challenge, which is what actually catches a replay. A graded
+liveness score no longer rejects anyone on its own.
 
 ```bash
 python tools/test_antispoof.py   # scores sample faces + measures latency
@@ -80,7 +89,7 @@ flags on top. Weights and thresholds are all in `config.py`.
 
 | signal | model | contributes |
 |---|---|---|
-| passive | MiniFASNetV2-SE | `W_PASSIVE` (0.60) + hard veto below `ANTISPOOF_SPOOF_VETO` |
+| passive | MiniFASNetV2-SE | `W_PASSIVE` (0.60) + hard veto (see above) |
 | head motion | MediaPipe Face Landmarker | `W_MOTION` (0.25) — yaw/pitch range across the 10 frames |
 | blink | MediaPipe Face Landmarker | `W_BLINK` (0.15) — EAR dip (open→closed) |
 | device | YOLOv8n | **hard DENY** if a `cell phone`/`laptop`/`tv` box overlaps the face box |
@@ -93,6 +102,17 @@ flags on top. Weights and thresholds are all in `config.py`.
   the face box (ratio ≈ 1.0), which is exactly the replay-attack geometry.
 - Each signal adds a human-readable reason. Per-signal latency is logged on
   every `/verify` and surfaced in the `parts` of the test tools.
+
+The reported liveness is the **weighted average** of the three signals. It used
+to be `min(passive, fused)`, which let one soft passive reading cap the whole
+score and pushed real faces below the old deny bar — that gate is gone.
+
+**Low light comes first.** If the face crop's mean grey level is below
+`MIN_FACE_BRIGHTNESS` (45) the passive model is not trusted at all: the answer
+is `RECAPTURE` *"Too dark — please face a light."*, checked **before** any spoof
+veto. The frame-wide bar (`MIN_BRIGHTNESS`, 20) stays relaxed — a dim frame can
+still be recognised; it is the face crop that needs real light for the texture
+model to mean anything.
 
 ```bash
 python tools/test_liveness.py    # all signals + per-signal latency (no webcam)
@@ -188,15 +208,77 @@ curl "localhost:8000/dev/force?decision=STEP_UP"  # pin every decision
 curl "localhost:8000/dev/force?decision=off"      # back to normal
 curl localhost:8000/dev/totp/Divya                # current valid TOTP code
 curl localhost:8000/dev/session/a1b2c3            # inspect a session
+curl "localhost:8000/dev/calibrate?label=real"    # start recording calibration
 ```
 
 `/dev/force` drives the kiosk UI through ALLOW, STEP_UP, DENY and RECAPTURE
 without a real spoof in front of the camera. `/dev/totp/<name>` lets the demo
 complete the step-up without an authenticator app.
 
+## Latency
+
+Every `/verify` response carries a `stage_ms` breakdown (also merged into
+`scores.latency_ms` for the demo panel, and logged):
+
+```
+stage_ms = {quality_ms, identify_ms, liveness_ms}
+liveness internals = {passive_ms, blinkmotion_ms, device_ms, calibmetrics_ms}
+```
+
+Measured on the dev box (16 logical cores), 10-frame burst, warm:
+
+| stage | ms |
+|---|---|
+| decode + quality gate | ~35 |
+| identify (detect + embed, 4 frames) | ~390 |
+| liveness (all signals, 2 of them concurrent) | ~105 |
+| **total** | **~535** |
+
+Inside liveness: passive ~25 ms, blink/motion ~100 ms, device ~40 ms,
+calibration metrics ~2 ms. Blink/motion and device run concurrently in a
+thread pool while passive runs on the request thread, so the liveness total is
+roughly the slowest of the three rather than their sum.
+
+That is well inside the 2 s budget (`TARGET_MS`), and a single `analyze` call
+is ~85 ms. **A multi-second `/verify` is contention or a cold start, not the
+algorithm** — the same code measured 3.9 s while the machine was loaded and
+0.5 s idle. Frame-level parallelism does not help (ONNX Runtime already uses
+`ORT_THREADS` intra-op threads, so extra threads just contend: 4 frames took
+373 ms sequential vs 233 ms threaded, with a worse tail). If a real kiosk run
+is slow, read `stage_ms` from the response — it says which stage blew up.
+
+## Threshold calibration
+
+The anti-spoof thresholds are room-dependent, so measure instead of guessing
+(guessing is what caused the false rejections). With the server running:
+
+```bash
+curl "localhost:8000/dev/calibrate?label=real"    # then ~10 real attempts
+curl "localhost:8000/dev/calibrate?label=spoof"   # then ~10 spoof attempts
+curl "localhost:8000/dev/calibrate?label=off"
+python tools/suggest_thresholds.py
+```
+
+Each `/verify` appends one row to `eval/calibration.csv` (git-ignored: it is
+measurement data): per-frame anti-spoof scores, moiré, face brightness, face
+blur, motion, blink, match, decision and the stage timings.
+`suggest_thresholds.py` prints the real and spoof distributions per signal and
+the cut-off with the fewest mistakes — and says plainly when the two ranges
+overlap, i.e. when that signal *cannot* separate them and tightening it would
+only reject real people again. Recording never changes a decision; the numbers
+go into `config.py` by hand.
+
+**Moiré** (`face_moire` in `liveness.py`) is the share of the face crop's FFT
+energy in the high-frequency band — a camera pointed at an LCD picks up the
+panel's pixel grid. It is **recorded only** and wired into nothing: no
+threshold is defensible before the calibration run says where real and spoof
+actually separate in the room.
+
 ## Tests
 
 ```bash
+python tools/smoke_liveness.py    # recalibrated spoof/real decision rules
+python tools/smoke_schedule.py    # campus schedule rules
 python tools/test_face_match.py   # genuine vs impostor separation + timing (no server)
 python tools/smoke_test.py        # full API walk (needs a running server)
 python tools/smoke_test.py http://1.2.3.4:8000

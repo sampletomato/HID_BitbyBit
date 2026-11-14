@@ -109,6 +109,61 @@ def face_brightness(detections: List[Detection]) -> Optional[float]:
     return float(np.mean(values)) if values else None
 
 
+def face_blur(detections: List[Detection]) -> Optional[float]:
+    """Variance of the Laplacian inside the face box: higher = sharper.
+
+    Recorded for calibration. A printed photo re-photographed is usually
+    softer than a real face, and a replay on a screen is often sharper in a
+    regular, grid-like way -- see face_moire.
+    """
+    values = []
+    for frame_bgr, (x, y, w, h) in detections[:config.ANTISPOOF_FRAMES]:
+        fh, fw = frame_bgr.shape[:2]
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(fw, int(x + w)), min(fh, int(y + h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        grey = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        values.append(float(cv2.Laplacian(grey, cv2.CV_64F).var()))
+    return float(np.mean(values)) if values else None
+
+
+def face_moire(detections: List[Detection]) -> Optional[float]:
+    """Share of the face crop's spectral energy sitting at high frequencies.
+
+    A camera pointed at an LCD or OLED panel picks up the panel's pixel grid as
+    a regular interference pattern (moire), which puts unusually much energy in
+    the high-frequency band. Real skin does not do this.
+
+    This is a measurement, NOT a veto: it is recorded to eval/calibration.csv
+    so a threshold can be chosen from real data in the actual room. Nothing in
+    the decision path reads it. Cheap -- one 128x128 FFT per frame.
+    """
+    values = []
+    for frame_bgr, (x, y, w, h) in detections[:config.ANTISPOOF_FRAMES]:
+        fh, fw = frame_bgr.shape[:2]
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(fw, int(x + w)), min(fh, int(y + h))
+        if x2 - x1 < 16 or y2 - y1 < 16:
+            continue
+        grey = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        # Fixed size so the ratio is comparable across face distances.
+        grey = cv2.resize(grey, (config.ANTISPOOF_INPUT, config.ANTISPOOF_INPUT))
+        spectrum = np.abs(np.fft.fftshift(np.fft.fft2(grey.astype(np.float32))))
+        total = float(spectrum.sum())
+        if total <= 0:
+            continue
+        n = spectrum.shape[0]
+        centre = n // 2
+        # Zero out the low-frequency disc, leaving the high-frequency ring.
+        radius = int(n * config.MOIRE_HIGHPASS_FRAC)
+        yy, xx = np.ogrid[:n, :n]
+        high = spectrum.copy()
+        high[((yy - centre) ** 2 + (xx - centre) ** 2) <= radius ** 2] = 0.0
+        values.append(float(high.sum()) / total)
+    return float(np.mean(values)) if values else None
+
+
 class PassiveAntiSpoof:
     """MiniFASNetV2-SE real/spoof model, loaded once at startup."""
 
@@ -460,25 +515,31 @@ class LivenessEngine:
         if motion is None:                       # landmarker gave < 2 head poses
             motion = self._motion_fallback(images)
 
+        # The reported liveness is the weighted AVERAGE of the three signals.
+        # It used to be min(passive, fused), which let one soft passive reading
+        # cap the whole score and drove real faces below the old deny bar. The
+        # anti-spoof model still dominates the mix (W_PASSIVE = 0.60) and still
+        # has its own hard veto below, which is where spoof rejection belongs --
+        # a graded score no longer rejects anybody by itself.
         fused = (config.W_PASSIVE * passive + config.W_MOTION * motion
                  + config.W_BLINK * blink)
         fused = round(float(np.clip(fused, 0.0, 1.0)), 2)
-
-        # Anti-spoof is a GATE, not just a weighted input: the liveness score
-        # used for the decision is min(passive, fused), so a low passive caps
-        # the whole score and motion can never rescue a spoof.
-        gated = round(min(passive, fused), 2)
+        gated = fused
 
         # --- hard flags -----------------------------------------------------
-        # A detected device, or a confident passive spoof, each force DENY --
-        # except in low light, where the passive model cannot tell a real face
-        # from a print. Then the veto is suppressed and the caller asks for a
-        # retake. The veto stays hard at normal brightness.
+        # A detected device, or a CONFIDENT passive spoof reading, each force
+        # DENY -- except in low light, where the passive model cannot tell a
+        # real face from a print. Then the veto is suppressed and the caller
+        # asks for a retake. The veto stays hard at normal brightness.
         brightness = face_brightness(detections)
         too_dark = brightness is not None and brightness < config.MIN_FACE_BRIGHTNESS
-        spoof_detected = (passive_avg is not None
-                          and passive_avg < config.ANTISPOOF_HARD_DENY
-                          and not too_dark)
+
+        # Two independent ways to trip the veto: a low burst average, or any
+        # single frame that reads as a confident spoof (which a pair of good
+        # frames would otherwise average away).
+        frame_panic = any(p < config.ANTISPOOF_FRAME_PANIC for p in passive_frames)
+        spoof_detected = (passive_avg is not None and not too_dark
+                          and (passive_avg < config.ANTISPOOF_HARD_DENY or frame_panic))
 
         device_ran = self.device.available and face_box is not None
 
@@ -489,7 +550,9 @@ class LivenessEngine:
         if too_dark:
             reasons.append(f"Face too dark to judge liveness (brightness {brightness:.0f})")
         if spoof_detected:
-            reasons.append("Spoof detected: print/screen texture")
+            reasons.append("Spoof detected: print/screen texture"
+                           + (f" (frame at {min(passive_frames):.2f})" if frame_panic
+                              else f" ({passive:.2f})"))
         elif passive_avg is None:
             reasons.append("Passive model unavailable, liveness reduced")
         elif passive >= config.ANTISPOOF_REAL_MIN:
@@ -501,18 +564,31 @@ class LivenessEngine:
         reasons.append(f"Head micro-motion present ({bm['yaw_range']:.1f}deg yaw)"
                        if motion >= 0.4 else "Frames look static, possible printed photo")
 
-        log.info("liveness gated=%.2f (fused=%.2f) passive=%.3f motion=%.2f blink=%.2f "
-                 "device=%s spoof=%s dark=%s (face brightness %s) | %s",
-                 gated, fused, passive, motion, blink,
+        # Calibration-only measurements: recorded, never vetoed on.
+        t = time.time()
+        moire = face_moire(detections)
+        blur = face_blur(detections)
+        timings["calibmetrics_ms"] = round((time.time() - t) * 1000, 1)
+
+        log.info("liveness=%.2f passive=%.3f (frames %s) motion=%.2f blink=%.2f "
+                 "device=%s spoof=%s dark=%s brightness=%s moire=%s blur=%s | %s",
+                 gated, passive,
+                 "[" + ", ".join(f"{p:.2f}" for p in passive_frames) + "]",
+                 motion, blink,
                  device_label or ("clear" if device_ran else "n/a"), spoof_detected,
-                 too_dark, "n/a" if brightness is None else f"{brightness:.0f}", timings)
+                 too_dark, "n/a" if brightness is None else f"{brightness:.0f}",
+                 "n/a" if moire is None else f"{moire:.3f}",
+                 "n/a" if blur is None else f"{blur:.0f}", timings)
 
         # device: label when detected, False when it ran and was clear, None if it
         # could not run -- so the response always carries a device result.
         device_report = device_label if device_seen else (False if device_ran else None)
-        parts = {"passive": round(passive, 3), "passive_frames": passive_frames,
+        parts = {"passive": round(passive, 3),
+                 "passive_frames": [round(p, 4) for p in passive_frames],
                  "face_brightness": round(brightness, 1) if brightness is not None else None,
-                 "too_dark": too_dark,
+                 "face_blur": round(blur, 1) if blur is not None else None,
+                 "moire": round(moire, 4) if moire is not None else None,
+                 "too_dark": too_dark, "frame_panic": frame_panic,
                  "fused": fused, "motion": round(motion, 2), "blink": round(blink, 2),
                  "blink_detected": bm["blink_detected"], "device": device_report,
                  "device_seen": device_seen, "device_ran": device_ran,

@@ -39,6 +39,8 @@ models/
 *.zip
 
 # --- eval artifacts ---
+# Room-specific threshold measurements from /dev/calibrate: data, not source.
+eval/calibration.csv
 eval/results/*.json
 eval/results/*.csv
 eval/results/*.png

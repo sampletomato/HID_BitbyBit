@@ -59,10 +59,16 @@ YUNET_MODEL = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
 SFACE_MODEL = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
 
 # ---------------------------------------------------------------- decisioning
-# Liveness is 0..1. Above ALLOW is confident, below DENY is a hard reject, the
-# band between falls through to an active challenge.
+# Liveness is 0..1. At or above ALLOW the face is confidently live. BELOW that
+# bar is NOT a rejection: it falls through to the active challenge, which is
+# what actually catches a replay. Only the hard vetoes in liveness.py (a
+# confident anti-spoof reading, or a phone/screen in frame) produce a DENY.
+#
+# A graded score no longer denies on its own. A dim room drags the fused score
+# down on a perfectly real face, and denying on that was rejecting real people
+# (measured: a real face at 27% in normal indoor light). The challenge is the
+# safety net for everything in the middle.
 LIVENESS_ALLOW = 0.75
-LIVENESS_DENY = 0.40
 
 # Match thresholds are cosine similarity and are NOT comparable across
 # backends: buffalo_l returns 512-d embeddings, SFace 128-d with a tighter
@@ -84,10 +90,19 @@ ANTISPOOF_INPUT = 128
 ANTISPOOF_BBOX_EXPANSION = 1.5   # facenox default; the model expects this context
 ANTISPOOF_FRAMES = 3             # run on the 3 sharpest detected frames of the burst
 ANTISPOOF_REAL_MIN = 0.5         # real-probability above which a frame reads "live"
-# Hard gate: real_prob below this is an immediate DENY -- motion or match can
-# never rescue a failed anti-spoof. The decision liveness is also gated at
-# min(passive, fused), so a low passive caps the whole score. Genuine faces >> this.
-ANTISPOOF_HARD_DENY = 0.30
+
+# Hard veto: an immediate DENY, not overridable by motion, match or a challenge.
+# Deliberately a LOW bar -- it fires only on a confident spoof reading. The old
+# 0.30 was rejecting real faces in ordinary indoor light; everything between
+# this bar and LIVENESS_ALLOW now goes to the active challenge instead.
+#
+# Two ways to trip it, so a single bad frame cannot be averaged away by two good
+# ones and a genuinely confident single reading is not ignored:
+#   - the burst AVERAGE real-probability is below ANTISPOOF_HARD_DENY, or
+#   - ANY one frame is below ANTISPOOF_FRAME_PANIC.
+# Both are calibrated from eval/calibration.csv: see tools/suggest_thresholds.py.
+ANTISPOOF_HARD_DENY = 0.15
+ANTISPOOF_FRAME_PANIC = 0.05
 
 # --------------------------------------------------- blink + motion (MediaPipe)
 # Face Landmarker (Tasks API) run on every verify frame. EAR = eye aspect ratio.
@@ -131,7 +146,14 @@ MAX_BRIGHTNESS = 240.0     # higher = blown out / backlit
 # Mean grey level of the FACE crop below which the passive anti-spoof model is
 # not trusted: a real face in the dark reads as "flat print texture", so a dark
 # face gets RECAPTURE ("Too dark") instead of a DENY. Same scale as MIN_BRIGHTNESS.
-MIN_FACE_BRIGHTNESS = MIN_BRIGHTNESS
+#
+# Deliberately HIGHER than MIN_BRIGHTNESS (which gates the whole frame, and is
+# relaxed to 20 for a dim webcam). The frame can be dim overall and still be
+# usable for recognition, while the face crop specifically needs real light
+# before the texture model means anything. At 20 this was letting dim faces
+# through to the spoof veto, which is how a real face got denied; the retake
+# prompt is the correct answer there. Refine from eval/calibration.csv.
+MIN_FACE_BRIGHTNESS = 45.0
 MIN_GOOD_FRAME_RATIO = 0.3  # need 3 good frames of 10 (relaxed, was 0.5)
 
 # -------------------------------------------------------------------- sessions
@@ -164,3 +186,17 @@ CHALLENGES = [
 
 # Budget for a single /verify call. Logged as a warning when exceeded.
 TARGET_MS = 2000
+
+# ------------------------------------------------------- threshold calibration
+# GET /dev/calibrate?label=real|spoof appends one row per /verify here, so the
+# thresholds above can be set from measurements in the actual demo room instead
+# of guessed. tools/suggest_thresholds.py reads this file.
+CALIBRATION_CSV = BASE_DIR.parent / "eval" / "calibration.csv"
+
+# Moire (screen-replay interference pattern) is RECORDED but does NOT veto.
+# It is a frequency-domain measurement, not a model: the ratio of high-frequency
+# energy to total energy in the face crop. A camera pointed at an LCD shows a
+# regular pixel grid that a real face does not. No threshold is wired into the
+# decision until the calibration run says where real and spoof actually separate
+# in this room -- guessing one is what caused the false rejections.
+MOIRE_HIGHPASS_FRAC = 0.25   # radius (as a fraction of the spectrum) counted as "high"

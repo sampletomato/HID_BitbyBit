@@ -30,6 +30,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import calibration
 import config
 import decision as dec
 import face as face_mod
@@ -176,10 +177,13 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
               schedule_reason: Optional[str] = None,
               scores: Optional[dict] = None,
               reason_code: Optional[str] = None,
-              extra: Optional[dict] = None) -> dict:
+              extra: Optional[dict] = None,
+              stages: Optional[dict] = None,
+              live_parts: Optional[dict] = None) -> dict:
     elapsed = int((time.time() - t0) * 1000)
     if elapsed > config.TARGET_MS:
-        log.warning("over budget: %d ms (target %d ms)", elapsed, config.TARGET_MS)
+        log.warning("over budget: %d ms (target %d ms) stages=%s",
+                    elapsed, config.TARGET_MS, stages)
 
     # One clear sentence for the kiosk. A pending TOTP normally wins the copy, so
     # the screen asks for the code rather than repeating the challenge -- except
@@ -205,23 +209,40 @@ def _response(verdict: str, name: Optional[str], liveness: float, match: float,
         "reasons": reasons,
         "scores": scores or {},      # per-signal breakdown for the demo panel
         "time_ms": elapsed,
+        "stage_ms": stages or {},    # per-stage breakdown: where the time went
         "session_id": session_id,
         "challenge": challenge,
     }
     if extra:
         body.update(extra)
+
+    # Calibration recording, when /dev/calibrate armed it. Observation only:
+    # the row is written after the decision and can never change it.
+    if live_parts is not None and calibration.recorder.active:
+        calibration.recorder.record(
+            decision=verdict, reason_code=code, name=name,
+            liveness=round(liveness, 2), match=round(match, 2),
+            parts=live_parts, time_ms=elapsed, stages=stages)
     return body
 
 
-def _scores(live, match: float) -> dict:
+def _scores(live, match: float, stages: Optional[dict] = None) -> dict:
     """Flatten the per-signal liveness parts + match into one small dict."""
     p = live.parts
-    return {"passive": p.get("passive"), "motion": p.get("motion"),
+    latency = {k: p[k] for k in ("passive_ms", "blinkmotion_ms", "device_ms",
+                                 "calibmetrics_ms") if k in p}
+    latency.update(stages or {})
+    return {"passive": p.get("passive"),
+            "passive_frames": p.get("passive_frames"),
+            "motion": p.get("motion"),
             "blink": p.get("blink"), "blink_detected": p.get("blink_detected"),
             "device": p.get("device"), "yaw_range": p.get("yaw_range"),
+            # Calibration diagnostics: recorded and shown, never vetoed on.
+            "face_brightness": p.get("face_brightness"),
+            "face_blur": p.get("face_blur"), "moire": p.get("moire"),
+            "too_dark": p.get("too_dark"), "frame_panic": p.get("frame_panic"),
             "match": round(match, 2),
-            "latency_ms": {k: p[k] for k in ("passive_ms", "blinkmotion_ms", "device_ms")
-                           if k in p}}
+            "latency_ms": latency}
 
 
 # Schedule outcomes that nothing can rescue: the person may be live and
@@ -327,20 +348,21 @@ def verify(req: VerifyRequest):
     t0 = time.time()
     rng = random.Random()
 
+    stages = {}
     t_decode = time.time()
     images = face_mod.decode_frames(req.frames)
     quality = face_mod.assess_quality(images, config.MIN_FRAMES_VERIFY)
-    t_quality = time.time()
+    stages["quality_ms"] = round((time.time() - t_decode) * 1000, 1)
     if not quality.ok:
         sid = state.new_session(None, 0.0, 0.0)
         return _response(_apply_force(dec.RECAPTURE), None, 0.0, 0.0,
                          [quality.reason], t0, sid,
-                         reason_code=msg.recapture_code(quality.reason))
+                         reason_code=msg.recapture_code(quality.reason),
+                         stages=stages)
 
+    t = time.time()
     name, match, burst = state.face.identify(images)
-    t_identify = time.time()
-    log.info("verify stages: decode+quality=%.0fms identify=%.0fms",
-             (t_quality - t_decode) * 1000, (t_identify - t_quality) * 1000)
+    stages["identify_ms"] = round((time.time() - t) * 1000, 1)
 
     # No usable face is a capture problem, not a spoof -- ask for another try.
     # The passive model needs a bbox, so it only runs once a face is found.
@@ -348,19 +370,25 @@ def verify(req: VerifyRequest):
         sid = state.new_session(None, 0.0, 0.0)
         return _response(_apply_force(dec.RECAPTURE), None, 0.0, 0.0,
                          [burst.note], t0, sid,
-                         reason_code=msg.recapture_code(burst.note))
+                         reason_code=msg.recapture_code(burst.note),
+                         stages=stages)
 
+    t = time.time()
     live = state.liveness.score(images, burst.detections, rng)
+    stages["liveness_ms"] = round((time.time() - t) * 1000, 1)
+    log.info("verify stages: %s", stages)
 
     # Low light is a capture problem, not an attack: the passive model reads an
-    # underexposed real face as flat print texture. Ask for a retake instead of
-    # denying a real person. (The hard spoof veto still applies in normal light.)
+    # underexposed real face as flat print texture, so this is checked BEFORE
+    # any spoof veto. Ask for a retake instead of denying a real person.
+    # (The hard spoof veto still applies at normal brightness.)
     if live.too_dark:
         sid = state.new_session(name, live.score, match)
         return _response(_apply_force(dec.RECAPTURE), name, live.score, match,
-                         ["Too dark to check liveness, please face the light"],
-                         t0, sid, scores=_scores(live, match),
-                         reason_code=msg.RECAPTURE_DARK)
+                         live.reasons, t0, sid,
+                         scores=_scores(live, match, stages),
+                         reason_code=msg.RECAPTURE_DARK, stages=stages,
+                         live_parts=live.parts)
 
     verdict, reasons, code = dec.decide(live.score, match, name,
                                   state.face.match_allow, state.face.match_deny,
@@ -373,7 +401,8 @@ def verify(req: VerifyRequest):
     if verdict == dec.DENY:
         sid = state.new_session(None, live.score, match)
         return _response(dec.DENY, None, live.score, match, reasons + live.reasons,
-                         t0, sid, scores=_scores(live, match), reason_code=code)
+                         t0, sid, scores=_scores(live, match, stages),
+                         reason_code=code, stages=stages, live_parts=live.parts)
 
     verdict = _apply_force(verdict)
 
@@ -396,8 +425,9 @@ def verify(req: VerifyRequest):
 
     return _response(verdict, name, live.score, match, reasons + live.reasons,
                      t0, sid, challenge, totp_required=totp_required,
-                     schedule_reason=sched_reason, scores=_scores(live, match),
-                     reason_code=code)
+                     schedule_reason=sched_reason,
+                     scores=_scores(live, match, stages),
+                     reason_code=code, stages=stages, live_parts=live.parts)
 
 
 @app.post("/challenge")
@@ -433,21 +463,31 @@ def challenge(req: ChallengeRequest):
         return _response(_apply_force(dec.RECAPTURE), enrolled, 0.0, 0.0,
                          [burst.note], t0, req.session_id, challenge=expected,
                          reason_code=msg.recapture_code(burst.note))
-    passive_avg, _, _ = state.liveness.passive.score_detections(burst.detections)
+    passive_avg, passive_frames, _ = \
+        state.liveness.passive.score_detections(burst.detections)
     brightness = liveness_mod.face_brightness(burst.detections)
     too_dark = brightness is not None and brightness < config.MIN_FACE_BRIGHTNESS
-    # Same rule as /verify: in low light the passive model is not trusted, so a
-    # dark face gets a retake rather than a spoof DENY.
-    spoof = (passive_avg is not None
-             and passive_avg < config.ANTISPOOF_HARD_DENY and not too_dark)
+    # Same recalibrated rule as /verify: the veto fires only on a CONFIDENT
+    # spoof reading (low burst average, or any single panic frame), and in low
+    # light the passive model is not trusted at all, so a dark face gets a
+    # retake rather than a spoof DENY.
+    frame_panic = any(p < config.ANTISPOOF_FRAME_PANIC for p in passive_frames)
+    spoof = (passive_avg is not None and not too_dark
+             and (passive_avg < config.ANTISPOOF_HARD_DENY or frame_panic))
 
     scores = {"passive": round(passive_avg, 3) if passive_avg is not None else None,
+              "passive_frames": [round(p, 4) for p in passive_frames],
               "face_brightness": round(brightness, 1) if brightness is not None else None,
+              "face_blur": liveness_mod.face_blur(burst.detections),
+              "moire": liveness_mod.face_moire(burst.detections),
+              "too_dark": too_dark, "frame_panic": frame_panic,
               "match": round(match, 2)}
 
     if too_dark:
         return _response(_apply_force(dec.RECAPTURE), enrolled, session["liveness"],
-                         match, ["Too dark to check liveness, please face the light"],
+                         match,
+                         [f"Face too dark to judge liveness (brightness "
+                          f"{brightness:.0f})"],
                          t0, req.session_id, challenge=expected, scores=scores,
                          reason_code=msg.RECAPTURE_DARK)
 
@@ -580,6 +620,30 @@ if config.DEV_MODE:
                 "usable": state.face.gallery.usable_for(state.face.backend_name),
                 "match_allow": state.face.match_allow,
                 "match_deny": state.face.match_deny}
+
+    @app.get("/dev/calibrate")
+    def dev_calibrate(label: str = ""):
+        """Arm threshold calibration: label=real | spoof | off.
+
+        While armed, every /verify appends its per-frame anti-spoof scores,
+        moire, brightness, blur and stage timings to eval/calibration.csv.
+        Record ~10 real and ~10 spoof attempts, then run
+        tools/suggest_thresholds.py. Recording never changes a decision.
+        """
+        if not label:
+            return {"ok": True, "label": calibration.recorder.label,
+                    "recorded_this_session": calibration.recorder.count,
+                    "rows_on_disk": calibration.recorder.rows_on_disk(),
+                    "csv": str(config.CALIBRATION_CSV),
+                    "usage": "/dev/calibrate?label=real|spoof|off"}
+        try:
+            active = calibration.recorder.set_label(label)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        log.info("calibration label set to %s", active or "off")
+        return {"ok": True, "label": active,
+                "rows_on_disk": calibration.recorder.rows_on_disk(),
+                "csv": str(config.CALIBRATION_CSV)}
 
     @app.get("/dev/force")
     def dev_force(decision: str = "off"):

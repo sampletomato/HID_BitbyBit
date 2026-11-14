@@ -42,8 +42,13 @@ def decide(liveness: float, match: float, name: Optional[str],
     if spoof_detected:
         return DENY, ["Spoof detected: print/screen texture"], "DENY_SPOOF"
 
-    if liveness < config.LIVENESS_DENY:
-        return DENY, [f"Presentation attack detected (liveness {liveness:.2f})"],             "DENY_SPOOF"
+    # NOTE: a low graded liveness score is deliberately NOT a DENY. It used to
+    # be (liveness < LIVENESS_DENY), and it was rejecting real people in
+    # ordinary indoor light, because a dim room pulls the fused score down on a
+    # genuine face. The hard vetoes above -- a confident anti-spoof reading or a
+    # phone/screen in frame -- are the only presentation-attack rejections.
+    # Everything between them and LIVENESS_ALLOW falls through to the active
+    # challenge below, which is what actually catches a replay.
 
     if name is None:
         return DENY, ["Face does not match any enrolled user"], "DENY_UNKNOWN_FACE"
