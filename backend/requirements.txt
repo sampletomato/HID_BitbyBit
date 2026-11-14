@@ -1,0 +1,34 @@
+# Ranges, not exact pins, on purpose: the dev boxes run Python 3.13 (no numpy
+# 1.26 wheel) and the EC2 target runs Ubuntu 22.04 / Python 3.10. These ranges
+# resolve to a working wheel set on both. Install with --only-binary to avoid
+# accidentally compiling numpy from source:
+#
+#   pip install --only-binary=:all: -r requirements.txt
+#   pip install insightface==0.7.3      # builds a small C extension, needs gcc
+#
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.34,<0.35
+pydantic>=2.10,<3
+numpy>=1.26,<2.3
+opencv-python-headless>=4.10,<5
+onnxruntime>=1.19,<2
+httpx>=0.27,<0.29
+
+# step-up auth
+pyotp>=2.9,<3
+qrcode[pil]>=7.4,<9
+
+# Face recognition. insightface drags in scipy/scikit-learn/matplotlib/
+# albumentations (~400 MB installed) and needs a C compiler. If it is painful
+# on EC2, skip it and run the lighter fallback instead:
+#   python tools/fetch_models.py && export FACE_BACKEND=opencv
+# That path needs only opencv + onnxruntime and ~37 MB of models.
+insightface==0.7.3
+
+# ---------------------------------------------------------------------------
+# Step 5 (liveness models). Person 2: pre-install so we are not waiting later.
+# ---------------------------------------------------------------------------
+# mediapipe>=0.10.14,<0.11
+# ultralytics>=8.3,<9
+# torch --index-url https://download.pytorch.org/whl/cpu
+# torchvision --index-url https://download.pytorch.org/whl/cpu

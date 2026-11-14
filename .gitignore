@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# --- secrets / config ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- test clips and captured media ---
+data/
+
+# --- enrolled identities (embeddings + TOTP secrets, edge-only, never commit) ---
+backend/store/
+users.json
+gallery.json
+
+# --- offline fail-safe queue + decision logs ---
+*.sqlite
+*.sqlite3
+*.db
+offline/
+backend/offline/
+*.offline.log
+logs/
+*.log
+
+# --- downloaded model weights ---
+backend/models/
+models/
+*.onnx
+*.pt
+*.pth
+*.zip
+
+# --- eval artifacts ---
+eval/results/*.json
+eval/results/*.csv
+eval/results/*.png
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
